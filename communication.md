@@ -130,4 +130,4 @@ frame = pack_velocity(1.0, 0.0, 0.0)  # 向前
 
 ## 8. 云台板独立通信
 
-板间业务协议已统一整理为 v4，完整帧格式、七类消息、时效规则和 UART/RS485/CAN 后端见 [底盘云台板间通信](docs/底盘云台板间通信.md)。本地固件当前仍在 USART10（PE2 RX、PE3 TX、921600/8N1）上运行旧的 10 字节 V1 yaw/status 链路；在 v4 编解码和两板同步迁移完成前，不能把 v4 帧发送给现有接收器。UART7 的 `AA 06 vx vy wz XOR` 是独立的上位机车身速度协议，不属于板间 v4 消息。
+板间业务协议已统一整理为 v4，完整帧格式、七类消息、时效规则和 UART/RS485/CAN 后端见 [底盘云台板间通信](docs/底盘云台板间通信.md)。本地底盘固件已在 USART10（PE2 RX、PE3 TX、921600/8N1）接入 v4 编解码、流式解析、Heartbeat/ChassisControl 控制和 Heartbeat/ChassisFeedback 回传；云台端同步升级及真实双板验证仍未完成，旧 V1 yaw/status 接口只保留作迁移兼容。UART7 的 `AA 06 vx vy wz XOR` 是独立的上位机车身速度协议，不属于板间 v4 消息。

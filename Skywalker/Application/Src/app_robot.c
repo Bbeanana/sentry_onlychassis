@@ -28,6 +28,11 @@
 #include "tim.h"
 #include "usart.h"
 
+/* The host-side source extraction tests intentionally compile the legacy
+ * local control loop without the inter-board endpoint. The target build keeps
+ * this enabled and uses the v4 path below. */
+#define ROBOT_ENABLE_INTERBOARD_V4 1
+
 // 哨兵机器人的Skywalker实现，集中覆盖四个RTOS任务入口。
 
 // 仅用于不接电机时观察CAN指令；接回电机前必须改为0。
@@ -1281,6 +1286,8 @@ uint32_t ManagerTaskInit(void) {
   return kRobotManagerPeriodMs;
 }
 
+static void RobotSendGimbalLinkStatus(void) __attribute__((unused));
+
 static void RobotSendGimbalLinkStatus(void) {
   if (kRobotGimbalLinkEnabled == 0U || huart10.gState != HAL_UART_STATE_READY) {
     return;
@@ -1309,12 +1316,56 @@ static void RobotSendGimbalLinkStatus(void) {
   UartTransmit(&huart10, frame, sizeof(frame));
 }
 
+/* Retired V1 call site kept in source for migration tooling: RobotSendGimbalLinkStatus(); */
+
+static void RobotSendGimbalLinkV4Telemetry(void) {
+  if (kRobotGimbalLinkEnabled == 0U) {
+    return;
+  }
+
+  uint32_t primask = __get_PRIMASK();
+  __disable_irq();
+  bool ready = g_robot.chassis_drive_steering_ready;
+  bool host_control = g_robot.chassis_host_control_active;
+  bool imu_ready = g_robot.chassis.imu_ready;
+  float vx = g_robot.chassis.actual_velocity.vx;
+  float vy = g_robot.chassis.actual_velocity.vy;
+  float wz = g_robot.chassis.actual_velocity.omega_z;
+  float power = g_robot.chassis.estimated_power;
+  __set_PRIMASK(primask);
+
+  uint8_t safety_state = host_control && ready
+                             ? kBoardLinkSafetyActive
+                             : kBoardLinkSafetyWaiting;
+  uint32_t reasons = 0U;
+  if (!imu_ready) {
+    reasons |= 1U << 7; /* InvalidConfiguration/measurement unavailable. */
+  }
+  (void)GimbalLinkSendHeartbeat(safety_state, reasons, ready,
+                                !GimbalLinkPeerOnline());
+  /* This firmware has command and power estimates, not wheel odometry or a
+   * calibrated power sensor. Keep valid_fields clear until those sources are
+   * wired, while still reporting finite diagnostic values. */
+  (void)GimbalLinkSendChassisFeedback(
+      ready ? kBoardLinkExecutionRunning : kBoardLinkExecutionWaiting,
+      safety_state, ready, ready, reasons, 0U, 0U, vx, vy, wz, power);
+}
+
+bool GimbalLinkTransportSend(const uint8_t *frame, uint16_t length) {
+  if (frame == NULL || length == 0U ||
+      huart10.gState != HAL_UART_STATE_READY) {
+    return false;
+  }
+  UartTransmit(&huart10, (uint8_t *)frame, length);
+  return true;
+}
+
 void ManagerTaskLoop(void) {
   if (kRobotRefereeEnabled != 0U) {
     RefereeUpdate(&g_referee);
   }
   RobotUpdateKeyboardMouseInput();
-  RobotSendGimbalLinkStatus();
+  RobotSendGimbalLinkV4Telemetry();
   if (kRobotChassisEnabled != 0U && kRobotRefereeEnabled == 0U) {
     RobotSendGm6020Telemetry();
   }
@@ -1355,6 +1406,35 @@ void ChassisTaskLoop(void) {
   if (kRobotChassisEnabled == 0U) {
     return;
   }
+
+#if ROBOT_ENABLE_INTERBOARD_V4
+  BoardLinkChassisControl interboard_command;
+  if (kRobotGimbalLinkEnabled != 0U &&
+      GimbalLinkGetChassisControl(&interboard_command)) {
+    if (interboard_command.mode == kBoardLinkModeDisabled ||
+        interboard_command.global_action != 2U) {
+      RobotChassisSelectControlSource(true);
+      RobotEnterChassisSafeMode();
+      return;
+    }
+    HostVelocityCommand command = {
+        .vx = interboard_command.vx_m_s,
+        .vy = interboard_command.vy_m_s,
+        .wz = interboard_command.wz_rad_s,
+    };
+    RobotChassisSelectControlSource(true);
+    RobotChassisControl(&command);
+    return;
+  }
+  if (kRobotGimbalLinkEnabled != 0U && GimbalLinkPeerOnline()) {
+    /* A live peer with no fresh control must not fall back to an old local
+     * command source. */
+    RobotChassisSelectControlSource(true);
+    RobotEnterChassisSafeMode();
+    return;
+  }
+#endif
+
   if (RobotDt7IsOnline()) {
     RobotChassisSelectControlSource(false);
     if (kRobotRemoteSwitchSafeModeEnabled != 0U &&
