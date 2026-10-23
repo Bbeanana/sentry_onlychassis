@@ -47,6 +47,7 @@ static struct {
   uint32_t chassis_6020_last_feedback_tick[4];
   bool chassis_drive_steering_ready, chassis_host_control_active;
 } g_robot;
+static const uint8_t kRobotChassisCanSlotWheelIndex[4] = {0U, 2U, 1U, 3U};
 static uint32_t tick, primask;
 static uint32_t osKernelGetTickCount(void) { return tick; }
 static uint32_t __get_PRIMASK(void) { return primask; }
@@ -79,7 +80,8 @@ static void near(double actual, double expected) {
   assert(fabs(actual - expected) < 0.00011);
 }
 int main(void) {
-  const unsigned index = ROBOT_GM6020_TELEMETRY_ID - 1;
+  const unsigned index =
+      kRobotChassisCanSlotWheelIndex[ROBOT_GM6020_TELEMETRY_ID - 1];
   RobotSendGm6020Telemetry();
   read_channels();
   near(channel[0], ROBOT_GM6020_TELEMETRY_ID);

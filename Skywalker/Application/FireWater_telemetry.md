@@ -2,7 +2,7 @@
 
 UART1（PA9 TX、GND）以 **921600 baud、8N1** 向 VOFA+ 发送纯数字 CSV，选择 **FireWater** 协议。管理任务每 **10 ms** 发送一行，以 `\n` 结束，无表头，共 **20 个通道**。UART 忙时跳过当次发送，实际间隔可能超过 10 ms；6020 控制周期仍为 **2 ms**。启用裁判系统后停止这路遥测。
 
-默认观察底盘 **GM6020 ID 1（左前）**。在 `app_robot.c` 顶部将 `ROBOT_GM6020_TELEMETRY_ID` 改为 1～4，或通过编译参数 `-DROBOT_GM6020_TELEMETRY_ID=2` 选择 ID 2。ID 2/3/4 分别为右前/左后/右后。这次修改替换了原来的 UART7/IMU 遥测通道；UART7 接收和底盘控制逻辑保持原有行为。
+默认观察底盘 **GM6020 ID 1（左前）**。在 `app_robot.c` 顶部将 `ROBOT_GM6020_TELEMETRY_ID` 改为 1～4，或通过编译参数 `-DROBOT_GM6020_TELEMETRY_ID=2` 选择 ID 2。由于 2、3 号轮组电机已互换安装，ID 2 对应左后、ID 3 对应右前，ID 4 对应右后。遥测代码会按 CAN ID 映射到对应物理轮位。这次修改替换了原来的 UART7/IMU 遥测通道；UART7 接收和底盘控制逻辑保持原有行为。
 
 | 通道（从 0 开始） | 内容 | 单位 |
 | --- | --- | --- |
@@ -39,7 +39,7 @@ UART1（PA9 TX、GND）以 **921600 baud、8N1** 向 VOFA+ 发送纯数字 CSV�
 
 ### 1. 速度环
 
-- 调试器中选择 `g_robot.chassis_motor_6020[id - 1]`，暂时将 `.mode` 改为 `kDjiMotorModeSpeed`。此模式下 `DjiMotorCurrentCalculate()` 不再用位置环覆盖 `given_omega`。保持运动指令有效，通过调试器修改 `.state.given_omega`，依次测试 `0 → 1 → 0 → -1 → 0 rad/s`，各平台约 0.5～1 s。控制仍开启时的 0 rad/s 是闭环制动；遥控归中会退出闭环。关注机构转动范围，采用短时间的小速度测试。
+- 调试器中选择对应物理轮位的 `g_robot.chassis_motor_6020[kRobotChassisCanSlotWheelIndex[id - 1]]`，暂时将 `.mode` 改为 `kDjiMotorModeSpeed`。此模式下 `DjiMotorCurrentCalculate()` 不再用位置环覆盖 `given_omega`。保持运动指令有效，通过调试器修改 `.state.given_omega`，依次测试 `0 → 1 → 0 → -1 → 0 rad/s`，各平台约 0.5～1 s。控制仍开启时的 0 rad/s 是闭环制动；遥控归中会退出闭环。关注机构转动范围，采用短时间的小速度测试。
 - 初始令 `.state.speed_loop.ki = 0`、`kd = 0`，从现有 `kp = 0.20` 起试。电流上限先保持 `0.8 A`。主要叠加通道 **5/6**，另开图观察 **8/9/10/11**。
 - 响应慢且未长期限流时，每次将 Kp 增加约 10%～20%；出现速度反复振荡、电流快速正负切换时降低 Kp。无需刻意调到持续振荡。
 - Kp 稳定后，只有持续存在速度偏差时才逐步加入 Ki。每次增大后观察稳态误差和回零/反转超调。若通道 11 长时间维持很大或反转拖尾，降低 Ki。速度环通常先用 PI，D 保持 0；本实现微分没有滤波，转速噪声可能被放大。

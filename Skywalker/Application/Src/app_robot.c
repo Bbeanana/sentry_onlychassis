@@ -91,13 +91,17 @@ static const float kRobotWheelRadiusM = 0.01f;
 static const float kRobotDriveReductionRatio = 1.0f;
 static const float kRobotChassisTranslationDeadband = 0.05f;
 static const float kRobotChassisTranslationStartDeadband = 0.08f;
-// ID 顺序：左前、右前、左后、右后；以下编码值对应轮子朝 +X（车头）。
+// 物理轮位数组顺序：左前、右前、左后、右后；以下编码值对应轮子朝 +X（车头）。
 static const float kRobotSteeringForwardAngleRad[4] = {
     3060.0f / 8192.0f * 2.0f * (float)M_PI,
     2421.0f / 8192.0f * 2.0f * (float)M_PI,
     2383.0f / 8192.0f * 2.0f * (float)M_PI,
     3097.0f / 8192.0f * 2.0f * (float)M_PI,
 };
+// 物理轮位到 DJI CAN 槽位的映射。2、3号轮组互换安装后，
+// CAN ID 2 对应左后（数组索引2），CAN ID 3 对应右前（数组索引1）。
+// 数组下标是 CAN 槽位（电机 ID - 1），值是物理轮位数组索引。
+static const uint8_t kRobotChassisCanSlotWheelIndex[4] = {0U, 2U, 1U, 3U};
 // 四个 GM6020 均倒置安装：相对前向零位的编码器角度偏移与轮组舵角相反。
 // 平移、原地旋转和混合运动统一使用此安装符号，零位编码值保持不变。
 static const float kRobotSteeringDirection[4] = {-1.0f, -1.0f, -1.0f, -1.0f};
@@ -429,7 +433,8 @@ static uint16_t RobotFormatGm6020Telemetry(char *buffer, size_t capacity) {
   if (buffer == NULL || capacity == 0U) {
     return 0U;
   }
-  const uint8_t index = ROBOT_GM6020_TELEMETRY_ID - 1U;
+  const uint8_t index =
+      kRobotChassisCanSlotWheelIndex[ROBOT_GM6020_TELEMETRY_ID - 1U];
   // 短临界区复制电机与控制状态，浮点计算和格式化在临界区外进行。
   uint32_t lock = __get_PRIMASK();
   __disable_irq();
@@ -492,7 +497,8 @@ static void RobotSendGm6020Telemetry(void) {
 // FDCAN1 接收底盘 GM6020 ID 1~4 的反馈（0x205~0x208）。
 static void RobotFdcan1RxCallback(uint32_t std_id, uint8_t *rx_buffer) {
   if (std_id >= 0x205U && std_id <= 0x208U) {
-    uint8_t index = (uint8_t)(std_id - 0x205U);
+    uint8_t can_slot = (uint8_t)(std_id - 0x205U);
+    uint8_t index = kRobotChassisCanSlotWheelIndex[can_slot];
     DjiMotorUpdate(&g_robot.chassis_motor_6020[index], rx_buffer);
     g_robot.chassis_6020_last_feedback_tick[index] = osKernelGetTickCount();
     g_robot.chassis_6020_has_feedback[index] = true;
@@ -521,7 +527,8 @@ static void RobotFdcan2RxCallback(uint32_t std_id, uint8_t *rx_buffer) {
 
 static void RobotFdcan3RxCallback(uint32_t std_id, uint8_t *rx_buffer) {
   if (std_id >= 0x201U && std_id <= 0x204U) {
-    uint8_t index = (uint8_t)(std_id - 0x201U);
+    uint8_t can_slot = (uint8_t)(std_id - 0x201U);
+    uint8_t index = kRobotChassisCanSlotWheelIndex[can_slot];
     DjiMotorUpdate(&g_robot.chassis_motor_3508[index], rx_buffer);
     g_robot.chassis_3508_last_feedback_tick[index] = osKernelGetTickCount();
     g_robot.chassis_3508_has_feedback[index] = true;
@@ -1037,15 +1044,17 @@ static void RobotChassisControl(const HostVelocityCommand *host_command) {
     g_robot.chassis.estimated_power = RobotEstimateChassisPower();
   }
   uint8_t tx_data[kRobotCanDataLength] = {0};
-  RobotPackDjiCurrents(&g_robot.chassis_motor_3508[0],
-                       &g_robot.chassis_motor_3508[1],
-                       &g_robot.chassis_motor_3508[2],
-                       &g_robot.chassis_motor_3508[3], tx_data);
+  RobotPackDjiCurrents(
+      &g_robot.chassis_motor_3508[kRobotChassisCanSlotWheelIndex[0]],
+      &g_robot.chassis_motor_3508[kRobotChassisCanSlotWheelIndex[1]],
+      &g_robot.chassis_motor_3508[kRobotChassisCanSlotWheelIndex[2]],
+      &g_robot.chassis_motor_3508[kRobotChassisCanSlotWheelIndex[3]], tx_data);
   FdcanTransmit(&hfdcan3, tx_data, kRobotCanDataLength, 0x200U);
-  RobotPackDjiCurrents(&g_robot.chassis_motor_6020[0],
-                       &g_robot.chassis_motor_6020[1],
-                       &g_robot.chassis_motor_6020[2],
-                       &g_robot.chassis_motor_6020[3], tx_data);
+  RobotPackDjiCurrents(
+      &g_robot.chassis_motor_6020[kRobotChassisCanSlotWheelIndex[0]],
+      &g_robot.chassis_motor_6020[kRobotChassisCanSlotWheelIndex[1]],
+      &g_robot.chassis_motor_6020[kRobotChassisCanSlotWheelIndex[2]],
+      &g_robot.chassis_motor_6020[kRobotChassisCanSlotWheelIndex[3]], tx_data);
   FdcanTransmit(&hfdcan1, tx_data, kRobotCanDataLength, 0x1FEU);
 }
 

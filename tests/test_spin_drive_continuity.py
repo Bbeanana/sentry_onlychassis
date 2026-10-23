@@ -28,6 +28,7 @@ stubs = r"""
 enum { kRobotChassisNoMotorTxTest = 0, kRobotChassisPeriodMs = 2,
        kRobotChassisFeedbackTimeoutMs = 50, kRobotRefereeEnabled = 0,
        kRobotCanDataLength = 8 };
+static const uint8_t kRobotChassisCanSlotWheelIndex[4] = {0U, 2U, 1U, 3U};
 static uint32_t tick = 100;
 static unsigned can_calls;
 static int hfdcan1, hfdcan3;

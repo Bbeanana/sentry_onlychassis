@@ -39,8 +39,9 @@ assert re.search(
     r"kDjiMotorModePosition,\s*&chassis_gm6020_speed_pid,\s*"
     r"&chassis_gm6020_position_pid\)", source
 )
-assert "&g_robot.chassis_motor_3508[3], tx_data" in source
-assert "&g_robot.chassis_motor_6020[3], tx_data" in source
+assert "chassis_motor_3508[kRobotChassisCanSlotWheelIndex[3]]" in source
+assert "kRobotChassisCanSlotWheelIndex[3]" in source
+assert "kRobotChassisCanSlotWheelIndex[4] = {0U, 2U, 1U, 3U}" in source
 assert "else if (std_id == 0x205U)" not in source
 
 names = (
@@ -81,6 +82,7 @@ static const float kRobotSteeringVectorHoldSpeedMps = 0.05f;
 static const float kRobotSteeringVectorResumeSpeedMps = 0.10f;
 static const float kRobotSteeringTargetRateMaxRadps = 4.0f;
 static const float kRobotSteeringDirectionLockBandRad = 0.10f;
+static const uint8_t kRobotChassisCanSlotWheelIndex[4] = {0U, 2U, 1U, 3U};
 static const float kRobotSteeringForwardAngleRad[4] = {
     3060.0f / 8192.0f * 2.0f * (float)M_PI,
     2421.0f / 8192.0f * 2.0f * (float)M_PI,
@@ -137,20 +139,22 @@ int main(void) {
 
   RobotFdcan1RxCallback(0x204U, frame);
   RobotFdcan1RxCallback(0x209U, frame);
-  for (uint8_t i = 0; i < kRobotChassisMotorCount; i++) {
-    assert(g_robot.chassis_motor_6020[i].updates == 0U);
-    RobotFdcan1RxCallback(0x205U + i, frame);
-    assert(g_robot.chassis_motor_6020[i].updates == 1U);
-    assert(g_robot.chassis_6020_has_feedback[i]);
+  for (uint8_t can_slot = 0; can_slot < kRobotChassisMotorCount; can_slot++) {
+    uint8_t wheel_index = kRobotChassisCanSlotWheelIndex[can_slot];
+    assert(g_robot.chassis_motor_6020[wheel_index].updates == 0U);
+    RobotFdcan1RxCallback(0x205U + can_slot, frame);
+    assert(g_robot.chassis_motor_6020[wheel_index].updates == 1U);
+    assert(g_robot.chassis_6020_has_feedback[wheel_index]);
   }
 
   RobotFdcan3RxCallback(0x200U, frame);
   RobotFdcan3RxCallback(0x205U, frame);
-  for (uint8_t i = 0; i < kRobotChassisMotorCount; i++) {
-    assert(g_robot.chassis_motor_3508[i].updates == 0U);
-    RobotFdcan3RxCallback(0x201U + i, frame);
-    assert(g_robot.chassis_motor_3508[i].updates == 1U);
-    assert(g_robot.chassis_3508_has_feedback[i]);
+  for (uint8_t can_slot = 0; can_slot < kRobotChassisMotorCount; can_slot++) {
+    uint8_t wheel_index = kRobotChassisCanSlotWheelIndex[can_slot];
+    assert(g_robot.chassis_motor_3508[wheel_index].updates == 0U);
+    RobotFdcan3RxCallback(0x201U + can_slot, frame);
+    assert(g_robot.chassis_motor_3508[wheel_index].updates == 1U);
+    assert(g_robot.chassis_3508_has_feedback[wheel_index]);
   }
 
   g_robot.chassis_motor_3508[0].state.given_current = 1.2f;
