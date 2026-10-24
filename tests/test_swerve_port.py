@@ -68,7 +68,8 @@ bool GimbalLinkGetYaw(GimbalYawFeedback *feedback) {
 }
 #endif
 enum { kRobotChassisMotorCount = 4U, kRobotSteeringIdleOverridesYaw = 1U,
-       kRobotChassisSpinTranslationEnabled = 1U };
+       kRobotChassisSpinTranslationEnabled = 1U,
+       kRobotChassisStandaloneMode = 0U };
 static struct {
   struct { int16_t ch2, ch3, wheel; uint8_t sw1; } rocker;
   struct { bool w, a, s, d, q, e; } key;

@@ -56,13 +56,20 @@ enum {
   kRobotChassisEnabled = 1U,
   // DT7在线时优先遥控；1U允许DT7离线时由UART7接管，0U离线停车。
   kRobotChassisHostControlEnabled = 1U,
+  // 1U: 云台板不在线时，遥控平移按车身坐标执行，不依赖 USART10 云台角；
+  // 云台板在线后仍自动切回云台坐标。接云台板后也可以保持 1U。
+  kRobotChassisStandaloneMode = 1U,
   // 非零旋转指令时启用 5ms 预测和小陀螺平移降速。
   kRobotChassisSpinTranslationEnabled = 1U,
   // USART10 用于云台相对角/底盘状态通信，与视觉串口互斥。
   kRobotGimbalLinkEnabled = 1U,
   kRobotGimbalEnabled = 0U,
+  // 大 Yaw 由底盘板执行：消费云台板 v4 BigYawRequest，J4310 速度模式。
+  kRobotBigYawEnabled = 1U,
   kRobotShootEnabled = 0U,
   kRobotVisionEnabled = 0U,
+  kRobotBigYawFeedbackTimeoutMs = 50U,
+  kRobotBigYawFeedbackPeriodMs = 100U,
   kRobotKeyboardMouseEnabled = 1U,
   kRobotRemoteSwitchSafeModeEnabled = 0U,
   kRobotManagerPeriodMs = 10,
@@ -98,10 +105,11 @@ static const float kRobotSteeringForwardAngleRad[4] = {
     2383.0f / 8192.0f * 2.0f * (float)M_PI,
     3097.0f / 8192.0f * 2.0f * (float)M_PI,
 };
-// 物理轮位到 DJI CAN 槽位的映射。2、3号轮组互换安装后，
-// CAN ID 2 对应左后（数组索引2），CAN ID 3 对应右前（数组索引1）。
-// 数组下标是 CAN 槽位（电机 ID - 1），值是物理轮位数组索引。
-static const uint8_t kRobotChassisCanSlotWheelIndex[4] = {0U, 2U, 1U, 3U};
+// 俯视左上角为 ID1，逆时针递增：
+// ID1 左前、ID2 左后、ID3 右后、ID4 右前。
+// 数组下标是 CAN 槽位（电机 ID - 1），值是物理轮位数组索引；
+// 物理轮位数组顺序固定为左前、右前、左后、右后。
+static const uint8_t kRobotChassisCanSlotWheelIndex[4] = {0U, 2U, 3U, 1U};
 // 四个 GM6020 均倒置安装：相对前向零位的编码器角度偏移与轮组舵角相反。
 // 平移、原地旋转和混合运动统一使用此安装符号，零位编码值保持不变。
 static const float kRobotSteeringDirection[4] = {-1.0f, -1.0f, -1.0f, -1.0f};
@@ -112,6 +120,9 @@ static const float kRobotMaxVyMps = 5.0f;
 static const float kRobotChassisMaxWheelSpeedMps = 5.0f;
 static const float kRobotSteeringCosineDeadbandRad = 0.05f;
 static const float kRobotMaxOmegaRadps = 10.0f;
+// 大 Yaw 只接受云台回中外环的速度请求，再做应用层限幅和方向适配。
+static const float kRobotBigYawMaxRateRadps = 1.0f;
+static const float kRobotBigYawDirection = 1.0f;
 static const float kRobotChassisWheelMaxOmegaRadps = -14.0f;
 static const float kRobotNoRefereeCurrentScale = 0.5f;
 static const float kRobotChassisYawRateFeedbackKp = 0.5f;
@@ -224,6 +235,14 @@ typedef struct {
   uint16_t bullet_count;
   uint32_t chassis_imu_last_tick;
   uint32_t gimbal_last_tick;
+  volatile uint32_t yaw_feedback_tick;
+  volatile bool yaw_feedback_valid;
+  bool big_yaw_request_valid;
+  bool big_yaw_active;
+  bool big_yaw_enabled;
+  uint32_t big_yaw_last_control_tick;
+  uint32_t big_yaw_last_command_sequence;
+  uint32_t big_yaw_feedback_last_tick;
   uint32_t keyboard_mouse_last_frame_count;
   volatile bool is_initialized;
   volatile bool is_initializing;
@@ -428,7 +447,8 @@ static void RobotPackDjiCurrents(const DjiMotor *motor_0,
   }
 }
 
-// FireWater 纯数字 CSV，10 ms 一行；通道表见 FireWater_telemetry.md。
+// FireWater 纯数字 CSV，10 ms 一行；当前调试输出：
+// 左摇杆 ch3、6020 请求角、PID 目标角、实际角、反馈有效。
 static uint16_t RobotFormatGm6020Telemetry(char *buffer, size_t capacity) {
   if (buffer == NULL || capacity == 0U) {
     return 0U;
@@ -438,6 +458,7 @@ static uint16_t RobotFormatGm6020Telemetry(char *buffer, size_t capacity) {
   // 短临界区复制电机与控制状态，浮点计算和格式化在临界区外进行。
   uint32_t lock = __get_PRIMASK();
   __disable_irq();
+  int16_t left_stick_raw = g_dt7_object.rocker.ch3;
   DjiMotorState state = g_robot.chassis_motor_6020[index].state;
   DjiMotorMode mode = g_robot.chassis_motor_6020[index].mode;
   float requested_angle = g_robot.chassis_steering_requested_angle[index];
@@ -445,8 +466,6 @@ static uint16_t RobotFormatGm6020Telemetry(char *buffer, size_t capacity) {
   bool has_feedback = g_robot.chassis_6020_has_feedback[index];
   uint32_t feedback_tick = g_robot.chassis_6020_last_feedback_tick[index];
   uint32_t now = osKernelGetTickCount();
-  bool drive_ready = g_robot.chassis_drive_steering_ready;
-  bool host_control = g_robot.chassis_host_control_active;
   __set_PRIMASK(lock);
 
   uint32_t age_ms = has_feedback ? now - feedback_tick : 0U;
@@ -460,23 +479,12 @@ static uint16_t RobotFormatGm6020Telemetry(char *buffer, size_t capacity) {
   }
   float target_continuous = position_active ? state.position_loop.reference
                                            : state.continuous_angle;
-  int length = snprintf(
-      buffer, capacity,
-      "%u,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,"
-      "%.1f,%u,%u,%lu,%.4f,%.4f,%u,%u\n",
-      (unsigned)ROBOT_GM6020_TELEMETRY_ID,
-      (double)requested_continuous, (double)target_continuous,
-      (double)state.continuous_angle,
-      (double)(position_active ? state.position_loop.error : 0.0f),
-      (double)state.given_omega, (double)state.omega,
-      (double)state.speed_loop.error,
-      (double)state.given_current, (double)state.current,
-      (double)(state.speed_loop.kp * state.speed_loop.error),
-      (double)(state.speed_loop.ki * state.speed_loop.error_sum),
-      (double)state.temperature, (unsigned)feedback_valid, (unsigned)active,
-      (unsigned long)age_ms, (double)state.position_loop.output_max,
-      (double)state.speed_loop.output_max,
-      (unsigned)drive_ready, (unsigned)host_control);
+  float left_stick = RobotRcNormalize(left_stick_raw);
+  int length = snprintf(buffer, capacity, "%.4f,%.4f,%.4f,%.4f,%u\n",
+                        (double)left_stick, (double)requested_continuous,
+                        (double)target_continuous,
+                        (double)state.continuous_angle,
+                        (unsigned)feedback_valid);
   if (length < 0 || (size_t)length >= capacity) {
     return 0U;
   }
@@ -520,6 +528,8 @@ static void RobotFdcan2RxCallback(uint32_t std_id, uint8_t *rx_buffer) {
       if (std_id == g_robot.yaw_motor.state.id ||
           std_id == g_robot.yaw_motor.state.master_id) {
         DmMotorUpdate(&g_robot.yaw_motor, rx_buffer);
+        g_robot.yaw_feedback_tick = HAL_GetTick();
+        g_robot.yaw_feedback_valid = true;
       }
       break;
   }
@@ -644,7 +654,8 @@ static void RobotSharedInit(void) {
   if (kRobotChassisEnabled != 0U) {
     FdcanInit(&hfdcan1, RobotFdcan1RxCallback);
   }
-  if (kRobotGimbalEnabled != 0U || kRobotShootEnabled != 0U) {
+  if (kRobotGimbalEnabled != 0U || kRobotShootEnabled != 0U ||
+      kRobotBigYawEnabled != 0U) {
     FdcanInit(&hfdcan2, RobotFdcan2RxCallback);
   }
   if (kRobotChassisEnabled != 0U || kRobotShootEnabled != 0U) {
@@ -930,12 +941,17 @@ static void RobotChassisKinematics(const HostVelocityCommand *host_command) {
     return;
   }
 
-  // 遥控始终使用实时云台坐标；UART7 保持当前车身坐标。
+  // 遥控默认使用实时云台坐标；UART7 保持当前车身坐标。
+  // 不接云台板时没有相对角，单独底盘测试把 kRobotChassisStandaloneMode
+  // 置 1，遥控平移直接按车身坐标执行，否则会被安全检查置零。
+  // 接回云台板后改为 0，恢复云台坐标转换。
+  bool input_in_body_frame = host_command != NULL ||
+                             kRobotChassisStandaloneMode != 0U;
   float vx = g_robot.chassis.desired_velocity.vx;
   float vy = g_robot.chassis.desired_velocity.vy;
   float desired_yaw_rate = g_robot.chassis.desired_velocity.omega_z;
   RobotChassisSpinTranslation(&vx, &vy, desired_yaw_rate,
-                              host_command != NULL);
+                              input_in_body_frame);
   float wz = desired_yaw_rate;
   if (g_robot.chassis.imu_ready) {
     wz += kRobotChassisYawRateFeedbackKp *
@@ -1196,6 +1212,107 @@ static void RobotChassisSelectControlSource(bool host_control) {
   }
 }
 
+static void RobotBigYawSendCommand(DmMotorCommand command) {
+  uint8_t tx_data[kRobotCanDataLength] = {0};
+  DmMotorPackCommand(&g_robot.yaw_motor, command, tx_data);
+  FdcanTransmit(&hfdcan2, tx_data, kRobotCanDataLength,
+                g_robot.yaw_motor.state.id);
+}
+
+static void RobotBigYawSendVelocity(float omega) {
+  g_robot.yaw_motor.state.given_omega = omega;
+  uint8_t tx_data[kRobotCanDataLength] = {0};
+  DmMotorPackVelocity(&g_robot.yaw_motor, tx_data);
+  FdcanTransmit(&hfdcan2, tx_data, kRobotCanDataLength,
+                DmMotorTxId(&g_robot.yaw_motor));
+}
+
+/* 底盘板大 Yaw：消费云台板 v4 BigYawRequest，J4310 速度模式。
+ * 只跟随云台回中外环的速度请求；请求超时、权限撤销或模式关闭时
+ * 先发零速度再失能，避免保留旧目标。 */
+static void RobotBigYawControl(void) {
+  if (kRobotBigYawEnabled == 0U) {
+    return;
+  }
+  const uint32_t now = HAL_GetTick();
+  BoardLinkBigYawRequest request;
+  bool request_valid = kRobotGimbalLinkEnabled != 0U &&
+                       GimbalLinkGetBigYawRequest(&request);
+  bool active = request_valid &&
+                request.mode == kBoardLinkBigYawFollowCenter &&
+                request.permission_valid && request.permission_enabled;
+  g_robot.big_yaw_request_valid = request_valid;
+
+  if (!active) {
+    if (g_robot.big_yaw_enabled) {
+      RobotBigYawSendVelocity(0.0f);
+      RobotBigYawSendCommand(kDmMotorCommandDisable);
+      g_robot.big_yaw_enabled = false;
+    }
+    g_robot.big_yaw_active = false;
+    g_robot.big_yaw_last_command_sequence =
+        request_valid ? request.source_sequence : 0U;
+    return;
+  }
+
+  if (g_robot.yaw_motor.state.error_code != 0U) {
+    RobotBigYawSendCommand(kDmMotorCommandClearError);
+    g_robot.big_yaw_enabled = false;
+    g_robot.big_yaw_active = false;
+    g_robot.big_yaw_last_command_sequence = request.source_sequence;
+    return;
+  }
+
+  if (!g_robot.big_yaw_enabled) {
+    RobotBigYawSendCommand(kDmMotorCommandEnable);
+    g_robot.big_yaw_enabled = true;
+  }
+
+  float target_rate = RobotClamp(
+      kRobotBigYawDirection * request.target_rate_rad_s,
+      -kRobotBigYawMaxRateRadps, kRobotBigYawMaxRateRadps);
+  RobotBigYawSendVelocity(target_rate);
+  g_robot.big_yaw_active = true;
+  g_robot.big_yaw_last_control_tick = now;
+  g_robot.big_yaw_last_command_sequence = request.source_sequence;
+}
+
+static void RobotSendBigYawFeedback(void) {
+  if (kRobotBigYawEnabled == 0U || kRobotGimbalLinkEnabled == 0U) {
+    return;
+  }
+  const uint32_t now = HAL_GetTick();
+  if ((uint32_t)(now - g_robot.big_yaw_feedback_last_tick) <
+      kRobotBigYawFeedbackPeriodMs) {
+    return;
+  }
+  g_robot.big_yaw_feedback_last_tick = now;
+
+  bool feedback_valid =
+      g_robot.yaw_feedback_valid &&
+      (uint32_t)(now - g_robot.yaw_feedback_tick) <=
+          kRobotBigYawFeedbackTimeoutMs;
+  BoardLinkBigYawFeedback feedback = {
+      .execution_state = !g_robot.big_yaw_request_valid
+                             ? kBoardLinkExecutionDisabled
+                             : (g_robot.big_yaw_active
+                                    ? kBoardLinkExecutionRunning
+                                    : kBoardLinkExecutionWaiting),
+      .ready = g_robot.big_yaw_active,
+      .armed = g_robot.big_yaw_enabled && g_robot.big_yaw_active,
+      .valid = feedback_valid,
+      .actual_rate_rad_s = g_robot.yaw_motor.state.omega,
+      .active_reasons = 0U,
+      .last_command_sequence = g_robot.big_yaw_last_command_sequence,
+      .source_sequence = g_robot.big_yaw_last_command_sequence,
+      .production_age_ms =
+          g_robot.big_yaw_active
+              ? (uint32_t)(now - g_robot.big_yaw_last_control_tick)
+              : 0U,
+  };
+  (void)GimbalLinkSendBigYawFeedback(&feedback);
+}
+
 static void RobotStopGimbalMotors(void) {
   g_robot.gimbal.target_yaw_angle = g_robot.chassis.target_yaw_angle;
   g_robot.gimbal.pitch_angle = kRobotPitchOffsetRad;
@@ -1375,6 +1492,7 @@ void ManagerTaskLoop(void) {
   }
   RobotUpdateKeyboardMouseInput();
   RobotSendGimbalLinkV4Telemetry();
+  RobotSendBigYawFeedback();
   if (kRobotChassisEnabled != 0U && kRobotRefereeEnabled == 0U) {
     RobotSendGm6020Telemetry();
   }
@@ -1404,7 +1522,7 @@ void GimbalTaskLoop(void) {
 }
 
 uint32_t ChassisTaskInit(void) {
-  if (kRobotChassisEnabled == 0U) {
+  if (kRobotChassisEnabled == 0U && kRobotBigYawEnabled == 0U) {
     return kRobotChassisPeriodMs;
   }
   RobotSharedInit();
@@ -1412,6 +1530,9 @@ uint32_t ChassisTaskInit(void) {
 }
 
 void ChassisTaskLoop(void) {
+  if (kRobotBigYawEnabled != 0U) {
+    RobotBigYawControl();
+  }
   if (kRobotChassisEnabled == 0U) {
     return;
   }

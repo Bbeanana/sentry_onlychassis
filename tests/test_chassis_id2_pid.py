@@ -41,7 +41,7 @@ assert re.search(
 )
 assert "chassis_motor_3508[kRobotChassisCanSlotWheelIndex[3]]" in source
 assert "kRobotChassisCanSlotWheelIndex[3]" in source
-assert "kRobotChassisCanSlotWheelIndex[4] = {0U, 2U, 1U, 3U}" in source
+assert "kRobotChassisCanSlotWheelIndex[4] = {0U, 2U, 3U, 1U}" in source
 assert "else if (std_id == 0x205U)" not in source
 
 names = (
@@ -82,7 +82,7 @@ static const float kRobotSteeringVectorHoldSpeedMps = 0.05f;
 static const float kRobotSteeringVectorResumeSpeedMps = 0.10f;
 static const float kRobotSteeringTargetRateMaxRadps = 4.0f;
 static const float kRobotSteeringDirectionLockBandRad = 0.10f;
-static const uint8_t kRobotChassisCanSlotWheelIndex[4] = {0U, 2U, 1U, 3U};
+static const uint8_t kRobotChassisCanSlotWheelIndex[4] = {0U, 2U, 3U, 1U};
 static const float kRobotSteeringForwardAngleRad[4] = {
     3060.0f / 8192.0f * 2.0f * (float)M_PI,
     2421.0f / 8192.0f * 2.0f * (float)M_PI,

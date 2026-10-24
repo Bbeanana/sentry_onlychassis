@@ -10,6 +10,7 @@ enum {
   kGimbalLinkTimeoutMs = 50U,             /* Retired V1 yaw compatibility. */
   kGimbalLinkControlTimeoutMs = 100U,
   kGimbalLinkHeartbeatTimeoutMs = 100U,
+  kGimbalLinkPermissionTimeoutMs = 300U,
 };
 
 typedef struct {
@@ -28,6 +29,7 @@ bool GimbalLinkTransportSend(const uint8_t *frame, uint16_t length);
 
 /* v4 snapshots consumed by the chassis application. */
 bool GimbalLinkGetChassisControl(BoardLinkChassisControl *control);
+bool GimbalLinkGetBigYawRequest(BoardLinkBigYawRequest *request);
 bool GimbalLinkPeerOnline(void);
 uint64_t GimbalLinkLocalBootId(void);
 
@@ -41,6 +43,7 @@ bool GimbalLinkSendChassisFeedback(uint8_t execution_state,
                                     uint32_t valid_fields, float vx_m_s,
                                     float vy_m_s, float wz_rad_s,
                                     float power_w);
+bool GimbalLinkSendBigYawFeedback(const BoardLinkBigYawFeedback *feedback);
 
 /* Retired V1 angle snapshot retained for local diagnostics and migration tests. */
 bool GimbalLinkGetLatest(GimbalYawFeedback *feedback);

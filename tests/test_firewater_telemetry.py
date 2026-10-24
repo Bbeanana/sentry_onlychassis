@@ -1,4 +1,4 @@
-"""Exercise GM6020 PID channels and the UART1 FireWater send path."""
+"""Exercise the current 5-channel GM6020 debug CSV and the UART1 send path."""
 
 from pathlib import Path
 import re
@@ -23,7 +23,8 @@ def definition(name):
 
 
 functions = "\n".join(definition(name) for name in (
-    "RobotWrapPi", "RobotFormatGm6020Telemetry", "RobotSendGm6020Telemetry",
+    "RobotClamp", "RobotRcNormalize", "RobotWrapPi",
+    "RobotFormatGm6020Telemetry", "RobotSendGm6020Telemetry",
 ))
 selection = re.search(
     r"#ifndef ROBOT_GM6020_TELEMETRY_ID.*?#endif\n#if.*?#endif",
@@ -45,9 +46,11 @@ static struct {
   bool chassis_steering_target_initialized[4];
   bool chassis_6020_has_feedback[4];
   uint32_t chassis_6020_last_feedback_tick[4];
-  bool chassis_drive_steering_ready, chassis_host_control_active;
 } g_robot;
-static const uint8_t kRobotChassisCanSlotWheelIndex[4] = {0U, 2U, 1U, 3U};
+static struct {
+  struct { int16_t ch3; } rocker;
+} g_dt7_object;
+static const uint8_t kRobotChassisCanSlotWheelIndex[4] = {0U, 2U, 3U, 1U};
 static uint32_t tick, primask;
 static uint32_t osKernelGetTickCount(void) { return tick; }
 static uint32_t __get_PRIMASK(void) { return primask; }
@@ -66,12 +69,12 @@ static void UartTransmit(void *uart, uint8_t *data, uint16_t length) {
   ++sends;
 }
 """ + functions + r"""
-static double channel[20];
+static double channel[5];
 static void read_channels(void) {
   char *cursor = sent;
-  for (unsigned i = 0; i < 20; ++i) {
+  for (unsigned i = 0; i < 5; ++i) {
     channel[i] = strtod(cursor, &cursor);
-    assert(*cursor == (i == 19 ? '\n' : ','));
+    assert(*cursor == (i == 4 ? '\n' : ','));
     ++cursor;
   }
   assert(*cursor == '\0');
@@ -84,10 +87,8 @@ int main(void) {
       kRobotChassisCanSlotWheelIndex[ROBOT_GM6020_TELEMETRY_ID - 1];
   RobotSendGm6020Telemetry();
   read_channels();
-  near(channel[0], ROBOT_GM6020_TELEMETRY_ID);
-  for (unsigned i = 1; i < 20; ++i) near(channel[i], 0);
+  for (unsigned i = 0; i < 5; ++i) near(channel[i], 0);
 
-  // Distinct motor values expose incorrect ID selection.
   for (unsigned i = 0; i < 4; ++i)
     g_robot.chassis_motor_6020[i].state.continuous_angle = 100 + i;
   DjiMotor *motor = &g_robot.chassis_motor_6020[index];
@@ -113,32 +114,17 @@ int main(void) {
   g_robot.chassis_steering_target_initialized[index] = true;
   g_robot.chassis_6020_has_feedback[index] = true;
   g_robot.chassis_6020_last_feedback_tick[index] = 100;
-  g_robot.chassis_drive_steering_ready = true;
-  g_robot.chassis_host_control_active = true;
+  g_dt7_object.rocker.ch3 = 660;
   tick = 105;
   primask = 1;
   RobotSendGm6020Telemetry();
   assert(primask == 1);
   read_channels();
+  near(channel[0], 1.0);
   near(channel[1], 0.15 + 4 * M_PI);
   near(channel[2], state->position_loop.reference);
   near(channel[3], state->continuous_angle);
-  near(channel[4], 0.1);
-  near(channel[5], 2);
-  near(channel[6], 1.5);
-  near(channel[7], 0.5);
-  near(channel[8], -0.05);
-  near(channel[9], -0.04);
-  near(channel[10], 0.1);
-  near(channel[11], -0.15);
-  near(channel[12], 37);
-  near(channel[13], 1);
-  near(channel[14], 1);
-  near(channel[15], 5);
-  near(channel[16], 4);
-  near(channel[17], 0.8);
-  near(channel[18], 1);
-  near(channel[19], 1);
+  near(channel[4], 1);
 
   char csv[512];
   uint16_t length = RobotFormatGm6020Telemetry(csv, sizeof(csv));
@@ -154,33 +140,38 @@ int main(void) {
   assert(sends == previous_sends);
   huart1.gState = HAL_UART_STATE_READY;
 
-  tick = 150;
-  RobotSendGm6020Telemetry(); read_channels();
-  near(channel[13], 1);
   tick = 151;
-  RobotSendGm6020Telemetry(); read_channels();
-  near(channel[13], 0); near(channel[14], 0);
+  RobotSendGm6020Telemetry();
+  read_channels();
+  near(channel[0], 1.0);
   near(channel[1], state->continuous_angle);
   near(channel[2], state->continuous_angle);
+  near(channel[3], state->continuous_angle);
   near(channel[4], 0);
+
   g_robot.chassis_6020_last_feedback_tick[index] = UINT32_MAX - 10;
   tick = 5;
-  RobotSendGm6020Telemetry(); read_channels();
-  near(channel[13], 1); near(channel[15], 16);
+  RobotSendGm6020Telemetry();
+  read_channels();
+  near(channel[4], 1);
 
-  // Idle/reset and speed-only mode must not display an old position reference.
   g_robot.chassis_steering_target_initialized[index] = false;
   primask = 0;
-  RobotSendGm6020Telemetry(); read_channels();
+  RobotSendGm6020Telemetry();
+  read_channels();
   assert(primask == 0);
-  near(channel[14], 0); near(channel[2], state->continuous_angle);
+  near(channel[2], state->continuous_angle);
+
   g_robot.chassis_steering_target_initialized[index] = true;
   motor->mode = kDjiMotorModeSpeed;
-  RobotSendGm6020Telemetry(); read_channels();
-  near(channel[14], 1); near(channel[4], 0);
+  RobotSendGm6020Telemetry();
+  read_channels();
+  near(channel[4], 1);
   near(channel[2], state->continuous_angle);
-  printf("PASS: GM6020 ID %u PID telemetry, wrap, freshness, buffer and UART1\n",
+
+  printf("PASS: GM6020 ID %u 5-channel debug CSV, wrap, freshness and UART1\n",
          ROBOT_GM6020_TELEMETRY_ID);
+  return 0;
 }
 """
 

@@ -44,7 +44,8 @@ uint32_t test_tick, test_primask;
 enum { kRobotChassisEnabled = 1U, kRobotChassisHostControlEnabled = 1U,
        kRobotHostCommandTimeoutMs = 100U, kRobotDt7OfflineTimeoutMs = 100U,
        kRobotRemoteSwitchSafeModeEnabled = TEST_REMOTE_STOP,
-       kRobotCanDataLength = 8U };
+       kRobotCanDataLength = 8U, kRobotBigYawEnabled = 0U };
+static void RobotBigYawControl(void) {}
 static uint32_t dt7_frames, dt7_tick;
 static uint32_t osKernelGetTickCount(void) { return test_tick; }
 static uint32_t Dt7FrameCount(void) { return dt7_frames; }

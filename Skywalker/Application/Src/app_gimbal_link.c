@@ -17,10 +17,14 @@ bool GimbalLinkTransportSend(const uint8_t *frame, uint16_t length) {
 static BoardLinkParser g_parser;
 static volatile BoardLinkHeartbeat g_heartbeat;
 static volatile BoardLinkChassisControl g_chassis_control;
+static volatile BoardLinkBigYawRequest g_big_yaw_request;
 static volatile bool g_has_heartbeat;
 static volatile bool g_has_chassis_control;
+static volatile bool g_has_big_yaw_request;
 static volatile bool g_has_control_sequence;
+static volatile bool g_has_big_yaw_sequence;
 static volatile uint32_t g_last_control_frame_sequence;
+static volatile uint32_t g_last_big_yaw_source_sequence;
 static uint64_t g_local_boot_id;
 static uint32_t g_tx_frame_sequence;
 
@@ -38,7 +42,10 @@ static uint64_t GimbalLinkMakeBootId(void) {
 static void GimbalLinkResetPeerSnapshots(void) {
   g_has_chassis_control = false;
   g_has_control_sequence = false;
+  g_has_big_yaw_request = false;
+  g_has_big_yaw_sequence = false;
   memset((void *)&g_chassis_control, 0, sizeof(g_chassis_control));
+  memset((void *)&g_big_yaw_request, 0, sizeof(g_big_yaw_request));
 }
 
 static void GimbalLinkAcceptFrame(const BoardLinkFrame *frame) {
@@ -74,6 +81,25 @@ static void GimbalLinkAcceptFrame(const BoardLinkFrame *frame) {
       g_has_control_sequence = true;
       g_chassis_control = control;
       g_has_chassis_control = true;
+      break;
+    }
+    case kBoardLinkBigYawRequest: {
+      BoardLinkBigYawRequest request;
+      if (!BoardLinkDecodeBigYawRequest(frame, &request)) {
+        return;
+      }
+      if (request.receiver_boot_id != g_local_boot_id) {
+        return;
+      }
+      if (g_has_big_yaw_sequence &&
+          !BoardLinkSequenceIsNewer(request.source_sequence,
+                                    g_last_big_yaw_source_sequence)) {
+        return;
+      }
+      g_last_big_yaw_source_sequence = request.source_sequence;
+      g_has_big_yaw_sequence = true;
+      g_big_yaw_request = request;
+      g_has_big_yaw_request = true;
       break;
     }
     default:
@@ -136,11 +162,15 @@ void GimbalLinkInit(void) {
   BoardLinkParserInit(&g_parser);
   memset((void *)&g_heartbeat, 0, sizeof(g_heartbeat));
   memset((void *)&g_chassis_control, 0, sizeof(g_chassis_control));
+  memset((void *)&g_big_yaw_request, 0, sizeof(g_big_yaw_request));
   memset((void *)&g_legacy_feedback, 0, sizeof(g_legacy_feedback));
   g_has_heartbeat = false;
   g_has_chassis_control = false;
+  g_has_big_yaw_request = false;
   g_has_control_sequence = false;
+  g_has_big_yaw_sequence = false;
   g_last_control_frame_sequence = 0U;
+  g_last_big_yaw_source_sequence = 0U;
   g_local_boot_id = GimbalLinkMakeBootId();
   g_tx_frame_sequence = 0U;
   g_legacy_rx_length = 0U;
@@ -172,6 +202,29 @@ bool GimbalLinkGetChassisControl(BoardLinkChassisControl *control) {
     return false;
   }
   *control = sample;
+  return true;
+}
+
+bool GimbalLinkGetBigYawRequest(BoardLinkBigYawRequest *request) {
+  if (request == NULL) {
+    return false;
+  }
+  uint32_t primask = __get_PRIMASK();
+  __disable_irq();
+  BoardLinkBigYawRequest sample = g_big_yaw_request;
+  bool available = g_has_big_yaw_request;
+  __set_PRIMASK(primask);
+  if (!available || !sample.stamp.valid ||
+      sample.receiver_boot_id != g_local_boot_id ||
+      (uint32_t)(HAL_GetTick() - sample.stamp.timestamp_ms) >
+          kGimbalLinkControlTimeoutMs ||
+      sample.command_age_ms > kGimbalLinkControlTimeoutMs ||
+      (sample.permission_valid &&
+       sample.permission_age_ms > kGimbalLinkPermissionTimeoutMs)) {
+    *request = (BoardLinkBigYawRequest){0};
+    return false;
+  }
+  *request = sample;
   return true;
 }
 
@@ -242,6 +295,19 @@ bool GimbalLinkSendChassisFeedback(uint8_t execution_state,
   uint16_t length = 0U;
   if (!BoardLinkEncodeChassisFeedback(&feedback, g_tx_frame_sequence++, frame,
                                       sizeof(frame), &length)) {
+    return false;
+  }
+  return GimbalLinkSendFrame(frame, length);
+}
+
+bool GimbalLinkSendBigYawFeedback(const BoardLinkBigYawFeedback *feedback) {
+  if (feedback == NULL) {
+    return false;
+  }
+  uint8_t frame[kBoardLinkMaxFrameSize];
+  uint16_t length = 0U;
+  if (!BoardLinkEncodeBigYawFeedback(feedback, g_tx_frame_sequence++, frame,
+                                     sizeof(frame), &length)) {
     return false;
   }
   return GimbalLinkSendFrame(frame, length);
