@@ -217,8 +217,9 @@ bool GimbalLinkGetBigYawRequest(BoardLinkBigYawRequest *request) {
   if (!available || !sample.stamp.valid ||
       sample.receiver_boot_id != g_local_boot_id ||
       (uint32_t)(HAL_GetTick() - sample.stamp.timestamp_ms) >
-          kGimbalLinkControlTimeoutMs ||
-      sample.command_age_ms > kGimbalLinkControlTimeoutMs ||
+          kGimbalLinkBigYawTimeoutMs ||
+      sample.source_age_ms > kGimbalLinkBigYawTimeoutMs ||
+      sample.command_age_ms > kGimbalLinkBigYawTimeoutMs ||
       (sample.permission_valid &&
        sample.permission_age_ms > kGimbalLinkPermissionTimeoutMs)) {
     *request = (BoardLinkBigYawRequest){0};

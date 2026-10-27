@@ -1,6 +1,8 @@
 # GM6020 调试 FireWater 遥测
 
-UART1（PA9 TX、GND）以 **921600 baud、8N1** 向 VOFA+ 发送纯数字 CSV，选择 **FireWater** 协议。管理任务每 **10 ms** 发送一行，以 `\n` 结束，无表头，共 **5 个通道**。UART 忙时跳过当次发送，实际间隔可能超过 10 ms；6020 控制周期仍为 **2 ms**。启用裁判系统后停止这路遥测。
+> 当前 `kRobotGm6020TelemetryEnabled=0`：USART1（PA9 TX、PA10 RX）已用于云台板间链路，460800/8N1。要恢复本遥测，需要把遥测移到其他 UART，或关闭云台链路后再启用。
+
+UART1（PA9 TX、GND）原本以 **921600 baud、8N1** 向 VOFA+ 发送纯数字 CSV，选择 **FireWater** 协议。管理任务每 **10 ms** 发送一行，以 `\n` 结束，无表头，共 **5 个通道**。UART 忙时跳过当次发送，实际间隔可能超过 10 ms；6020 控制周期仍为 **2 ms**。启用裁判系统后停止这路遥测。
 
 默认观察底盘 **GM6020 ID 1（左前）**。在 `app_robot.c` 顶部将 `ROBOT_GM6020_TELEMETRY_ID` 改为 1～4，或通过编译参数 `-DROBOT_GM6020_TELEMETRY_ID=2` 选择 ID 2。实车轮组按俯视左上角为 ID1、逆时针递增：ID1 左前、ID2 左后、ID3 右后、ID4 右前。遥测代码会按 CAN ID 映射到对应物理轮位。
 

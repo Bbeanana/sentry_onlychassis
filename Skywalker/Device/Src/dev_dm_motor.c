@@ -156,7 +156,12 @@ void DmMotorUpdate(DmMotor *motor, const uint8_t rx_data[8])
       (uint16_t)((((uint16_t)rx_data[4] & 0x0FU) << 8) | (uint16_t)rx_data[5]);
 
   motor->state.id = (uint32_t)(rx_data[0] & 0x0FU);
-  motor->state.error_code = (uint8_t)(rx_data[0] >> 4);
+  /* J4310 fault codes are 8..E; values below 8 are status/reserved bits,
+   * not faults.  Treating 0x1 as a fault causes disable/enable toggling. */
+  {
+    uint8_t status_code = (uint8_t)(rx_data[0] >> 4);
+    motor->state.error_code = status_code >= 8U ? status_code : 0U;
+  }
   motor->state.angle = DmMotorUintToFloat(position, kDmMotorPositionMin,
                                           kDmMotorPositionMax, 16);
   motor->state.omega = DmMotorUintToFloat(velocity, kDmMotorVelocityMin,

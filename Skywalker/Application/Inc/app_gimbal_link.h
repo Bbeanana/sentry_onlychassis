@@ -11,6 +11,10 @@ enum {
   kGimbalLinkControlTimeoutMs = 100U,
   kGimbalLinkHeartbeatTimeoutMs = 100U,
   kGimbalLinkPermissionTimeoutMs = 300U,
+  /* BigYawRequest is produced at ~100 ms.  A 100 ms freshness window makes
+   * jitter look like request loss and toggles enable/disable; keep a wider
+   * window for this actuator only. */
+  kGimbalLinkBigYawTimeoutMs = 250U,
 };
 
 typedef struct {
