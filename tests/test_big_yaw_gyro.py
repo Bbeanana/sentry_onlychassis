@@ -19,10 +19,8 @@ config = re.search(r"^enum \{.*?^};", source, re.M | re.S).group()
 state = source[source.index("typedef struct {"):source.index("static float RobotClamp")]
 constants = "\n".join(re.search(r"^static const float " + name + r"\b.*?;",
                                  source, re.M | re.S).group() for name in (
-    "kRobotBigYawHeadingKp", "kRobotBigYawHeadingCorrectionMaxRadps",
-    "kRobotBigYawImuRateKp", "kRobotBigYawImuRateKi", "kRobotChassisYawWheelDeadband", "kRobotBigYawGyroDirection", "kRobotBigYawGyroRatio", "kRobotBigYawGyroMaxRateRadps",
+    "kRobotChassisYawWheelDeadband", "kRobotBigYawGyroDirection", "kRobotBigYawGyroRatio", "kRobotBigYawGyroMaxRateRadps",
     "kRobotImuYawRateSign", "kRobotBigYawTorqueLimitNm", "kRobotBigYawMaxRateRadps",
-    "kRobotBigYawDirection", "kRobotBigYawRcSign", "kRobotGimbalYawDeadband",
     "kRobotBigYawCascadeFallbackDtS", "kRobotBigYawCascadeMaxDtS",
     "kRobotBigYawMaxPositionErrorRad", "kRobotBigYawPositionOutputMaxRadps",
 ))
@@ -50,13 +48,13 @@ stubs = r"""
 static uint32_t tick = 100, primask, rc_frames, rc_tick;
 static int hfdcan3, sensor_status;
 static float sensor_rate, sent_torque, sent_rate;
-static unsigned imu_reads, enable_calls, disable_calls, clear_calls, chassis_calls, stops;
+static unsigned gimbal_imu_reads, imu_reads, enable_calls, disable_calls, clear_calls, chassis_calls, stops;
 static bool board_available = true, peer_online = true, host_available, host_selected;
 static bool request_available;
 static bool external_imu_available = true;
 static GimbalImuYaw external_imu = {.sender_boot_id=42, .zero_generation=1, .valid=true};
 bool GimbalLinkGetImuYaw(GimbalImuYaw *out) {
-  *out = external_imu; return external_imu_available && peer_online;
+  ++gimbal_imu_reads; *out = external_imu; return external_imu_available && peer_online;
 }
 static BoardLinkChassisControl board = {.mode = 1, .global_action = 2};
 static BoardLinkBigYawRequest request;
@@ -90,9 +88,9 @@ bool HostVelocityProtocolGetCommand(HostVelocityCommand *out, uint32_t age) {
   (void)age; *out = (HostVelocityCommand){.wz = 0.8f}; return host_available;
 }
 static void FdcanTransmit(int *bus, uint8_t *data, uint16_t length, uint32_t id) {
-  assert(bus == &hfdcan3 && length == 8);
+  assert(bus == &hfdcan3);
   assert(id == (kRobotBigYawGyroCompensationEnabled ? 0x206U : 6U));
-  bool command = true;
+  bool command = length == 8;
   for (int i = 0; i < 7; ++i) command = command && data[i] == 0xFF;
   if (command) {
     if (data[7] == kDmMotorCommandEnable) ++enable_calls;
@@ -101,11 +99,13 @@ static void FdcanTransmit(int *bus, uint8_t *data, uint16_t length, uint32_t id)
     return;
   }
   if (kRobotBigYawGyroCompensationEnabled) {
+    assert(length == 4);
     memcpy(&sent_rate, data, sizeof(sent_rate));
     for (int i=4;i<8;i++) assert(data[i]==0);
     assert(isfinite(sent_rate) && fabsf(sent_rate)<=kRobotBigYawGyroMaxRateRadps);
     return;
   }
+  assert(length == 8);
   // MIT p/v/kp/kd fields remain zero targets/gains; decode actual wire torque.
   assert((data[3] & 15) == 0 && data[4] == 0 && data[5] == 0 && (data[6] >> 4) == 0);
   unsigned raw = ((unsigned)(data[6] & 15) << 8) | data[7];
@@ -129,13 +129,14 @@ control_entry = function("RobotChassisControl").split(
 }
 """
 functions = "\n".join(function(name) for name in (
-    "RobotClamp", "RobotWrapPi", "RobotRcNormalize", "RobotApplyDeadband",
+    "RobotClamp", "RobotWrapPi", "RobotRcNormalize", "RobotApplyDeadband", "RobotBigYawEncoderUpdate",
     "RobotChassisImuUpdate", "RobotBigYawSendCommand", "RobotBigYawSendMitTorque",
-    "RobotBigYawSendVelocity", "RobotBigYawSendStop", "RobotBigYawResetCascade", "RobotBigYawImuHeadingRate", "RobotBigYawControl", "RobotDt7IsOnline",
+    "RobotBigYawSendVelocity", "RobotBigYawSendStop", "RobotBigYawResetCascade", "RobotBigYawStabilizedRate", "RobotBigYawControl", "RobotDt7IsOnline",
     "RobotEnterChassisSafeMode", "ChassisTaskLoop",
 ))
 tests = r"""
 static void feedback(void) {
+  RobotBigYawEncoderUpdate();
   g_robot.yaw_feedback_valid = true;
   g_robot.yaw_feedback_tick = tick;
 }
@@ -144,85 +145,62 @@ static void step(bool with_feedback) {
   if (with_feedback) feedback();
   unsigned reads = imu_reads;
   ChassisTaskLoop();
-  assert(imu_reads == reads + 1); // one current sample per task iteration
+  assert(imu_reads == reads + (g_bmi088.is_inited && g_bmi088.is_gyro_offset_inited ? 1U : 0U));
 }
 static void settle(void) { for (int i = 0; i < 8; ++i) step(true); }
 static void near(float a, float b) { assert(fabsf(a - b) < 0.0001f); }
-// Simple velocity-mode plant: world rate = real chassis disturbance + physical motor rate.
-// IMU arrives at 50 Hz; motor response time is 20 ms. Tests the actual closed-loop function.
-static void simulated_heading_lock(void) {
-  RobotBigYawResetCascade();
-  GimbalImuYaw measured={.sender_boot_id=7,.zero_generation=1,.valid=true};
-  float heading=0, motor_rate=0, peak=0;
-  for(int i=0;i<6000;i++) {
-    float disturbance = i<500 ? 0 : 0.8f;
-    float world_rate=disturbance + kRobotBigYawGyroDirection*motor_rate/kRobotBigYawGyroRatio;
-    if(i%10==0) {measured.yaw_delta_rad=RobotWrapPi(heading);measured.yaw_rate_rad_s=world_rate;measured.source_age_ms=0;}
-    else measured.source_age_ms+=2;
-    float command=RobotBigYawImuHeadingRate(&measured,0,0.002f);
-    assert(isfinite(command)&&fabsf(command)<=kRobotBigYawGyroMaxRateRadps);
-    motor_rate+=(command-motor_rate)*(0.002f/0.020f);
-    heading+=world_rate*0.002f;
-    if(fabsf(heading)>peak)peak=fabsf(heading);
-  }
-  assert(peak<0.6f && fabsf(heading)<0.02f);
-  assert(fabsf(0.8f+kRobotBigYawGyroDirection*motor_rate/kRobotBigYawGyroRatio)<0.02f);
-}
 int main(void) {
   InitMotor();
   PidInit(&g_robot.big_yaw_position_pid, &big_yaw_position_pid);
   PidInit(&g_robot.big_yaw_velocity_pid, &big_yaw_velocity_pid);
   g_bmi088.is_inited = g_bmi088.is_gyro_offset_inited = true;
+  request_available=true;
+  request=(BoardLinkBigYawRequest){.mode=kBoardLinkBigYawFollowCenter,
+    .permission_valid=true,.permission_enabled=true};
   sensor_rate=2;settle();
-  assert(g_robot.big_yaw_active&&g_robot.big_yaw_heading_initialized);
+  assert(g_robot.big_yaw_active && g_robot.big_yaw_gyro_active);
   assert(g_robot.yaw_motor.mode==kDmMotorModeVelocity);
-  near(sent_rate,0); // a stationary gimbal requires no artificial inverse chassis-rate command
-  sensor_rate=-3;step(true);near(sent_rate,0);
-  external_imu.yaw_delta_rad=0.2f;external_imu.yaw_rate_rad_s=0.3f;step(true);
-  assert(g_robot.big_yaw_heading_error_rad< -0.19f && sent_rate>0.2f);
-  // Reset/re-enable captures the current IMU heading instead of chasing an old target.
-  board.global_action=0;step(true);assert(!g_robot.big_yaw_heading_initialized);near(sent_rate,0);
-  board.global_action=2;external_imu.yaw_rate_rad_s=0;settle();
-  near(g_robot.big_yaw_heading_target_rad,0.2f);near(sent_rate,0);
-  request_available=true;request=(BoardLinkBigYawRequest){.mode=kBoardLinkBigYawFollowCenter,
-      .permission_valid=true,.permission_enabled=true,.target_rate_rad_s=0.5f};
-  board.wz_rad_s=0.8f;settle();assert(sent_rate<0);
-  assert(g_robot.big_yaw_heading_target_rad>0.2f);
-  // Wheel release holds the current measured heading, not the previously integrated command.
-  external_imu.yaw_delta_rad=0.17f;request.target_rate_rad_s=0;step(true);
-  near(g_robot.big_yaw_heading_target_rad,0.17f);near(g_robot.big_yaw_heading_error_rad,0);
-  // Wraparound uses the short path, not a nearly full revolution.
-  RobotBigYawResetCascade();external_imu.yaw_delta_rad=3.13f;step(true);
-  external_imu.yaw_delta_rad=-3.13f;step(true);
-  assert(fabsf(g_robot.big_yaw_heading_error_rad)<0.03f);
-  // A changed external zero cannot retain the former target/integrator.
-  external_imu.sender_boot_id++;external_imu.yaw_delta_rad=-1;step(true);
-  near(g_robot.big_yaw_heading_target_rad,-1);near(sent_rate,0);
-  // Sensor feedback (even a large measured disturbance) has bounded speed output.
-  external_imu.yaw_rate_rad_s=34;settle();near(sent_rate,kRobotBigYawGyroMaxRateRadps);
-  external_imu.yaw_rate_rad_s=-34;settle();assert(fabsf(sent_rate)<=kRobotBigYawGyroMaxRateRadps);
-  external_imu.yaw_rate_rad_s=0;
-  // External IMU loss must stop/disable; no old chassis-gyro fallback.
-  unsigned before=chassis_calls;external_imu_available=false;step(true);
-  assert(chassis_calls==before+1&&!g_robot.big_yaw_active&&!g_robot.big_yaw_heading_initialized);
-  near(sent_rate,0);assert(disable_calls>0);
-  external_imu_available=true;external_imu.yaw_delta_rad=NAN;step(true);assert(!g_robot.big_yaw_active);
-  external_imu.yaw_delta_rad=0;external_imu.yaw_rate_rad_s=INFINITY;step(true);assert(!g_robot.big_yaw_active);
-  external_imu.yaw_rate_rad_s=0;settle();assert(g_robot.big_yaw_active);near(sent_rate,0);
-  // Chassis permission, stale live-peer command, motor feedback and motor faults still revoke output.
-  board.global_action=0;step(true);assert(!g_robot.big_yaw_active);near(sent_rate,0);
-  board_available=false;peer_online=true;before=chassis_calls;step(true);assert(chassis_calls==before);
-  board_available=true;board.global_action=2;settle();
-  tick+=kRobotBigYawFeedbackTimeoutMs+1;step(false);assert(!g_robot.big_yaw_active);near(sent_rate,0);
+  near(sent_rate,kRobotBigYawGyroDirection*kRobotBigYawGyroRatio*(-2));
+  sensor_rate=-3;step(true);
+  near(sent_rate,kRobotBigYawGyroDirection*kRobotBigYawGyroRatio*3);
+  // Actual measured base rate, never the requested chassis rotation.
+  board.wz_rad_s=0.8f;sensor_rate=0;step(true);near(sent_rate,0);
+  request.target_rate_rad_s=0.5f;sensor_rate=0.8f;step(true);
+  near(sent_rate,kRobotBigYawGyroDirection*kRobotBigYawGyroRatio*(-0.3f));
+  request.target_rate_rad_s=0;step(true);
+  near(sent_rate,kRobotBigYawGyroDirection*kRobotBigYawGyroRatio*(-0.8f));
+  // Changing, invalid or missing cloud IMU never affects compensation.
+  for(int i=0;i<1000;++i){
+    external_imu.yaw_delta_rad=i*0.1f;external_imu.yaw_rate_rad_s=NAN;
+    external_imu_available=i%2;external_imu.valid=false;
+    step(true);assert(g_robot.big_yaw_active);
+    near(sent_rate,kRobotBigYawGyroDirection*kRobotBigYawGyroRatio*(-0.8f));
+  }
+  assert(gimbal_imu_reads==0);
+  sensor_rate=34;step(true);near(sent_rate,kRobotBigYawGyroMaxRateRadps);
+  sensor_rate=-34;step(true);near(sent_rate,-kRobotBigYawGyroMaxRateRadps);
+  // Base IMU loss, nonfinite rate and explicit permission revocation stop yaw.
+  sensor_status=kBmi088NoSensor;step(true);assert(!g_robot.big_yaw_active);near(sent_rate,0);
+  sensor_status=kBmi088NoError;sensor_rate=NAN;step(true);assert(!g_robot.big_yaw_active);
+  sensor_rate=0;settle();assert(g_robot.big_yaw_active);
+  request.permission_enabled=false;step(true);assert(!g_robot.big_yaw_active);
+  request.permission_enabled=true;settle();assert(g_robot.big_yaw_active);
+  board.global_action=0;step(true);assert(!g_robot.big_yaw_active);
+  board.global_action=2;settle();assert(g_robot.big_yaw_active);
+  tick+=kRobotBigYawFeedbackTimeoutMs+1;step(false);assert(!g_robot.big_yaw_active);
   settle();assert(g_robot.big_yaw_active);
   g_robot.yaw_motor.state.error_code=8;step(true);unsigned clears=clear_calls;
-  step(true);assert(clear_calls==clears&&!g_robot.big_yaw_active);near(sent_rate,0);
+  step(true);assert(clear_calls==clears&&!g_robot.big_yaw_active);
   g_robot.yaw_motor.state.error_code=0;settle();assert(g_robot.big_yaw_active);
-  simulated_heading_lock();
-  puts("PASS: real external-IMU heading/rate lock, wheel/release, no chassis feedforward, wrap, simulated spinning base, permissions and faults");
+  // Local wheel fallback adds operator rate before installation conversion.
+  board_available=false;peer_online=false;request_available=false;rc_frames=1;
+  g_dt7_object.rocker.wheel=660;sensor_rate=0.5f;settle();
+  near(sent_rate,kRobotBigYawGyroDirection*kRobotBigYawGyroRatio*0.5f);
+  assert(gimbal_imu_reads==0);
+  puts("PASS: measured base-rate cancellation, wheel/release, zero cloud IMU reads, permissions, sensor loss, faults, motor timeout and velocity DLC4");
 }
 """
-legacy_tests = tests.split("// Simple velocity-mode plant:")[0] + r"""
+legacy_tests = tests.split("int main(void)")[0] + r"""
 int main(void) {
   InitMotor();
   PidInit(&g_robot.big_yaw_position_pid, &big_yaw_position_pid);
@@ -232,21 +210,46 @@ int main(void) {
   request_available = true;
   request = (BoardLinkBigYawRequest){.mode = kBoardLinkBigYawFollowCenter,
       .permission_valid = true, .permission_enabled = true, .target_rate_rad_s = 0.25f};
-  settle(); near(g_robot.big_yaw_target_rate, 0.25f);
-  assert(g_robot.big_yaw_active && !g_robot.big_yaw_gyro_active && sent_torque > 0);
-  // A fresh revoked request still prevents right-stick fallback in legacy mode.
-  request.permission_enabled = false; rc_frames = 1; g_dt7_object.rocker.ch0 = 660;
+  settle(); near(g_robot.big_yaw_target_rate, -0.25f);
+  assert(g_robot.big_yaw_active && !g_robot.big_yaw_gyro_active && sent_torque < 0);
+  // A fresh revoked request still prevents wheel fallback in encoder mode.
+  request.permission_enabled = false; rc_frames = 1; g_dt7_object.rocker.wheel = 660;
   step(true); assert(!g_robot.big_yaw_active && fabsf(sent_torque) < 0.01f);
   request_available = false; settle(); near(g_robot.big_yaw_target_rate, -1);
   assert(g_robot.big_yaw_manual_active && g_robot.big_yaw_active);
-  puts("PASS: gyro mode off preserves inter-board cascade, revocation and right-stick fallback");
+  // No gimbal IMU reads, even with drift, invalid samples or missing sensors.
+  g_dt7_object.rocker.wheel = 0;
+  external_imu_available = false;
+  g_bmi088.is_inited = g_bmi088.is_gyro_offset_inited = false;
+  g_robot.chassis.imu_ready = false;
+  g_robot.yaw_motor.state.angle = 0.3f;
+  RobotBigYawResetCascade();
+  settle();
+  const float held = g_robot.big_yaw_target_angle;
+  for (int i=0; i<1000; ++i) {
+    external_imu.yaw_delta_rad = i * 0.01f;
+    external_imu.yaw_rate_rad_s = NAN;
+    external_imu_available = i % 2;
+    step(true);
+    assert(g_robot.big_yaw_active && !g_robot.big_yaw_gyro_active);
+    near(g_robot.big_yaw_target_angle, held);
+    near(g_robot.big_yaw_target_rate, 0);
+  }
+  assert(gimbal_imu_reads == 0);
+  // Position error is corrected using the encoder alone.
+  g_robot.yaw_motor.state.angle = held + 0.1f;
+  step(true); assert(sent_torque < 0);
+  // Lost motor feedback still disables output.
+  for(int i=0;i<60;++i) step(false);
+  assert(!g_robot.big_yaw_active && !g_robot.big_yaw_enabled);
+  puts("PASS: encoder cascade, wheel/revocation, fixed hold, zero gimbal IMU reads, sensor loss and motor timeout");
 }
 """
 with tempfile.TemporaryDirectory(prefix="big_yaw_gyro_") as directory:
     work = Path(directory)
     for mode, cases in ((1, tests), (0, legacy_tests)):
-        selected = config.replace("kRobotBigYawGyroCompensationEnabled = 1U",
-                                  f"kRobotBigYawGyroCompensationEnabled = {mode}U")
+        selected = re.sub(r"kRobotBigYawGyroCompensationEnabled = [01]U",
+                                  f"kRobotBigYawGyroCompensationEnabled = {mode}U", config)
         (work / "test.c").write_text(prefix + selected + state + constants + pid_configs +
                                      stubs + "static void InitMotor(void) {" + motor_init + "}\n" +
                                      control_entry + functions + cases)

@@ -1,21 +1,23 @@
-"""Verify actual command routing/coordinate transform with the current swerve solver."""
+"""Run the real encoder frame transform, command routing and swerve resolver."""
 from pathlib import Path
 import re
 import subprocess
 import tempfile
-root=Path(__file__).resolve().parents[1]
-s=(root/'Skywalker/Application/Src/app_robot.c').read_text()
+root = Path(__file__).resolve().parents[1]
+s = (root/'Skywalker/Application/Src/app_robot.c').read_text()
 def function(name):
     return re.search(r'^(?:static )?[^\n]*\b'+name+r'\([^{};]*\) \{.*?^\}',s,re.M|re.S).group()
-config=re.search(r'^enum \{.*?^};',s,re.M|re.S).group()
-state=s[s.index('typedef struct {'):s.index('static float RobotClamp')].replace('static void RobotBigYawControl(void);','')
-names=('kRobotBigYawFeedbackTimeoutMs','kRobotChassisSpinCommandEpsilon','kRobotChassisSpinYawCompensationS','kRobotChassisSpinLateralScale','kRobotChassisSpinForwardScale','kRobotMaxVxMps','kRobotMaxVyMps','kRobotMaxOmegaRadps')
-constants='\n'.join(re.search(r'^static const float '+n+r'\b.*?;',s,re.M|re.S).group() for n in names if n!='kRobotBigYawFeedbackTimeoutMs')
-# Execute the actual kinematics entry through its frame selection and transform.
-entry=function('RobotChassisKinematics').split('  float wz = desired_yaw_rate;')[0]+'''\n  g_robot.chassis.actual_velocity.vx=vx;
+config = re.search(r'^enum \{.*?^};',s,re.M|re.S).group()
+state = s[s.index('typedef struct {'):s.index('static float RobotClamp')].replace('static void RobotBigYawControl(void);','')
+names = ('kRobotChassisSpinCommandEpsilon',
+         'kRobotChassisSpinLateralScale','kRobotChassisSpinForwardScale',
+         'kRobotMaxVxMps','kRobotMaxVyMps','kRobotMaxOmegaRadps',
+         'kRobotBigYawGyroDirection','kRobotBigYawGyroRatio','kRobotBigYawForwardZeroRad')
+constants = '\n'.join(re.search(r'^static const float '+n+r'\b.*?;',s,re.M|re.S).group() for n in names)
+entry = function('RobotChassisKinematics').split('  float wz = desired_yaw_rate;')[0]+'''\n  g_robot.chassis.actual_velocity.vx=vx;
   g_robot.chassis.actual_velocity.vy=vy;
 }\n'''
-code=r'''
+code = r'''
 #include <assert.h>
 #include <math.h>
 #include <stdbool.h>
@@ -30,141 +32,140 @@ code=r'''
 #define ROBOT_CHASSIS_NO_MOTOR_TX_TEST 0
 typedef int Bmi088Status;
 '''+config+state+constants+r'''
-static uint32_t tick=200;
-static GimbalImuYaw imu_sample;
-static bool imu_valid=true;
-bool GimbalLinkGetImuYaw(GimbalImuYaw *sample){*sample=imu_sample;return imu_valid;}
+static uint32_t tick=200,irq_mask=0;
+static uint32_t HAL_GetTick(void){return tick;}
+static uint32_t __get_PRIMASK(void){return irq_mask;}
+static void __disable_irq(void){irq_mask=1;}
+static void __set_PRIMASK(uint32_t v){irq_mask=v;}
 static bool RobotChassisRemoteVelocity(bool *spin){*spin=false;return false;}
-'''+function('RobotClamp')+function('RobotWrapPi')+function('RobotChassisGimbalHeadingUpdate')+function('RobotChassisSpinTranslation')+entry+r'''
+'''+function('RobotClamp')+function('RobotWrapPi')+function('RobotBigYawEncoderUpdate')+function('RobotChassisGimbalHeadingUpdate')+function('RobotChassisSpinTranslation')+entry+r'''
 static void near(float a,float b){assert(fabsf(a-b)<0.00001f);}
-static void reset(void){
- memset(&g_robot,0,sizeof(g_robot));g_robot.chassis.imu_ready=true;
- g_robot.chassis.gimbal_imu_heading_valid=true;
- imu_valid=true;imu_sample=(GimbalImuYaw){.sender_boot_id=42,.zero_generation=1};
+static void pose(float relative_yaw,float relative_rate){
  g_robot.yaw_feedback_valid=true;g_robot.yaw_feedback_tick=tick;
+ g_robot.yaw_motor.state.angle=kRobotBigYawForwardZeroRad+
+     relative_yaw*kRobotBigYawGyroDirection*kRobotBigYawGyroRatio;
+ g_robot.big_yaw_encoder_initialized=true;
+ g_robot.big_yaw_encoder_previous_raw=g_robot.yaw_motor.state.angle;
+ g_robot.big_yaw_encoder_wraps=0;
+ g_robot.big_yaw_encoder_continuous_rad=g_robot.yaw_motor.state.angle;
+ g_robot.yaw_motor.state.omega=relative_rate*kRobotBigYawGyroDirection*kRobotBigYawGyroRatio;
+ g_robot.yaw_motor.state.error_code=0;
+ RobotChassisGimbalHeadingUpdate(true);assert(irq_mask==0);
+ assert(g_robot.chassis.big_yaw_heading_valid);
 }
 int main(void){
  HostVelocityCommand c={.vx=0.2f,.vy=0,.wz=0.8f};
- reset();g_robot.chassis_interboard_control_active=true;
- // Physical CCW relative yaw from paired IMU headings.
- g_robot.chassis.gimbal_imu_absolute_yaw=(float)M_PI/2;
- RobotChassisKinematics(&c);
- near(g_robot.chassis.actual_velocity.vx,0);
- near(g_robot.chassis.actual_velocity.vy,0.2f*kRobotChassisSpinForwardScale);
- // Full-turn sweep: body motion rotated back to gimbal frame remains forward.
- for(int i=-180;i<=180;i+=5){
-  float a=i*(float)M_PI/180;
-  g_robot.chassis.gimbal_imu_absolute_yaw=a;RobotChassisKinematics(&c);
-  float x=g_robot.chassis.actual_velocity.vx,y=g_robot.chassis.actual_velocity.vy;
-  near(cosf(a)*x+sinf(a)*y,0.2f*kRobotChassisSpinForwardScale);
-  near(-sinf(a)*x+cosf(a)*y,0);
+ g_robot.chassis_interboard_control_active=true;
+ // Sweep past one full revolution on either side, including wrapping and both installation signs.
+ for(int i=-720;i<=720;i+=5){
+  const float angle=i*(float)M_PI/180;
+  pose(angle,0);RobotChassisKinematics(&c);
+  const float x=g_robot.chassis.actual_velocity.vx,y=g_robot.chassis.actual_velocity.vy;
+  near(x,cosf(angle)*0.2f*kRobotChassisSpinForwardScale);
+  near(y,sinf(angle)*0.2f*kRobotChassisSpinForwardScale);
+  near(cosf(angle)*x+sinf(angle)*y,0.2f*kRobotChassisSpinForwardScale);
+  near(-sinf(angle)*x+cosf(angle)*y,0);
   SwerveWheelVector wheels[4];SwerveResolve(x,y,c.wz,0.106066f,0.106066f,wheels);
-  float mean_x=0,mean_y=0;for(int k=0;k<4;k++){mean_x+=wheels[k].vx/4;mean_y+=wheels[k].vy/4;}
+  float mean_x=0,mean_y=0;
+  for(int k=0;k<4;k++){mean_x+=wheels[k].vx/4;mean_y+=wheels[k].vy/4;}
   near(mean_x,x);near(mean_y,y);
  }
- // Both headings vary independently; world motion always follows the current gimbal IMU.
- for(int gi=-150;gi<=150;gi+=30) for(int bi=-180;bi<=180;bi+=30){
-  float ga=gi*(float)M_PI/180, ba=bi*(float)M_PI/180;
-  g_robot.chassis.gimbal_imu_absolute_yaw=ga;g_robot.chassis.chassis_imu_absolute_yaw=ba;
-  g_robot.yaw_motor.state.angle=99; // motor encoder must not influence the direction
-  RobotChassisKinematics(&c);
-  float x=g_robot.chassis.actual_velocity.vx,y=g_robot.chassis.actual_velocity.vy;
-  near(cosf(ba)*x-sinf(ba)*y,cosf(ga)*0.2f*kRobotChassisSpinForwardScale);
-  near(sinf(ba)*x+cosf(ba)*y,sinf(ga)*0.2f*kRobotChassisSpinForwardScale);
+ // Real protocol wrapping, forward and reverse, many complete turns.
+ g_robot.big_yaw_encoder_initialized=false;
+ const double origin=kRobotBigYawForwardZeroRad;
+ for(int segment=0;segment<2;++segment){
+  for(int i=0;i<=20000;++i){
+   const double physical=origin+(segment==0?i:20000-i)*0.01;
+   double raw=fmod(physical+12.5,25.0);if(raw<0)raw+=25.0;raw-=12.5;
+   g_robot.yaw_motor.state.angle=(float)raw;
+   g_robot.yaw_motor.state.error_code=0;
+   g_robot.yaw_feedback_tick=tick;
+   RobotBigYawEncoderUpdate();RobotChassisGimbalHeadingUpdate(true);
+   const double rel=kRobotBigYawGyroDirection*(physical-origin)/kRobotBigYawGyroRatio;
+   assert(fabs(sin(rel)-sinf(g_robot.chassis.big_yaw_relative_yaw_rad))<0.00001);
+   assert(fabs(cos(rel)-cosf(g_robot.chassis.big_yaw_relative_yaw_rad))<0.00001);
+   RobotChassisKinematics(&c);
+   near(g_robot.chassis.actual_velocity.vx,cos(rel)*0.2*kRobotChassisSpinForwardScale);
+   near(g_robot.chassis.actual_velocity.vy,sin(rel)*0.2*kRobotChassisSpinForwardScale);
+  }
  }
- g_robot.chassis.chassis_imu_absolute_yaw=0;
- // Measured chassis rate, not requested rate, drives the 7 ms prediction.
- g_robot.chassis.gimbal_imu_absolute_yaw=0;g_robot.chassis.yaw_rate=2;
- RobotChassisKinematics(&c);
- near(g_robot.chassis.actual_velocity.vy,-sinf(0.014f)*0.2f*kRobotChassisSpinForwardScale);
- // UART7 is already in body coordinates even during spin.
- g_robot.chassis_interboard_control_active=false;RobotChassisKinematics(&c);
- near(g_robot.chassis.actual_velocity.vx,0.2f*kRobotChassisSpinForwardScale);
+ assert(g_robot.big_yaw_encoder_wraps==0);
+ // Cross the negative boundary too, then return through it.
+ for(int segment=0;segment<2;++segment){
+  for(int i=0;i<=20000;++i){
+   const double physical=origin-(segment==0?i:20000-i)*0.01;
+   double raw=fmod(physical+12.5,25.0);if(raw<0)raw+=25.0;raw-=12.5;
+   g_robot.yaw_motor.state.angle=(float)raw;
+   RobotBigYawEncoderUpdate();RobotChassisGimbalHeadingUpdate(false);
+   const double rel=kRobotBigYawGyroDirection*(physical-origin)/kRobotBigYawGyroRatio;
+   assert(fabs(sin(rel)-sinf(g_robot.chassis.big_yaw_relative_yaw_rad))<0.00001);
+   assert(fabs(cos(rel)-cosf(g_robot.chassis.big_yaw_relative_yaw_rad))<0.00001);
+  }
+ }
+ assert(g_robot.big_yaw_encoder_wraps==0);
+ // Neither accumulated IMU angle nor the base's measured rate changes the encoder frame.
+ // Repeat for simulated 10 minutes while both IMU headings accumulate large errors.
+ for(int i=0;i<6000;i++){
+  tick+=100;g_robot.chassis.yaw_angle=i*1.11f;
+  g_robot.chassis.yaw_rate=(i%2)?30:-30;g_robot.chassis.imu_ready=false;
+  pose(0.4f,0);RobotChassisKinematics(&c);
+  near(g_robot.chassis.actual_velocity.vx,cosf(0.4f)*0.2f*kRobotChassisSpinForwardScale);
+  near(g_robot.chassis.actual_velocity.vy,sinf(0.4f)*0.2f*kRobotChassisSpinForwardScale);
+ }
+ // Even during spin, theta is the encoder position without rate/age prediction.
+ pose(0,-2);RobotChassisKinematics(&c);
  near(g_robot.chassis.actual_velocity.vy,0);
- // Straight driving uses the same relative angle, without accumulating an offset.
- g_robot.chassis_interboard_control_active=true;c.wz=0;
- g_robot.chassis.gimbal_imu_absolute_yaw=(float)M_PI/2;
- for(int i=0;i<100;i++)RobotChassisKinematics(&c);
+ tick+=10;RobotChassisGimbalHeadingUpdate(true);RobotChassisKinematics(&c);
+ near(g_robot.chassis.actual_velocity.vy,0);
+ // Straight driving and strafe use the same calibrated encoder frame.
+ c.wz=0;pose((float)M_PI/2,0);RobotChassisKinematics(&c);
  near(g_robot.chassis.actual_velocity.vx,0);near(g_robot.chassis.actual_velocity.vy,0.2f);
- near(g_robot.chassis.gimbal_imu_absolute_yaw,(float)M_PI/2);
- // Strafe follows gimbal left; stop remains stop, pure spin remains pure spin.
- c.vx=0;c.vy=0.2f;c.wz=0.8f;g_robot.chassis.yaw_rate=0;RobotChassisKinematics(&c);
+ c.vx=0;c.vy=0.2f;RobotChassisKinematics(&c);
+ near(g_robot.chassis.actual_velocity.vx,-0.2f);near(g_robot.chassis.actual_velocity.vy,0);
+ c.wz=0.8f;RobotChassisKinematics(&c);
  near(g_robot.chassis.actual_velocity.vx,-0.2f*kRobotChassisSpinLateralScale);
- near(g_robot.chassis.actual_velocity.vy,0);
- c.vy=0;RobotChassisKinematics(&c);near(g_robot.chassis.actual_velocity.vx,0);near(g_robot.chassis.actual_velocity.vy,0);
- c.wz=0;RobotChassisKinematics(&c);assert(g_robot.chassis.steering_idle);
- // Feedback loss blocks gimbal-relative translation, not UART7 body translation.
- c.vx=0.2f;c.wz=0.8f;g_robot.chassis.gimbal_imu_heading_valid=false;RobotChassisKinematics(&c);
+ c.vy=0;RobotChassisKinematics(&c);
  near(g_robot.chassis.actual_velocity.vx,0);near(g_robot.chassis.actual_velocity.vy,0);
- g_robot.chassis_interboard_control_active=false;RobotChassisKinematics(&c);
- near(g_robot.chassis.actual_velocity.vx,0.2f*kRobotChassisSpinForwardScale);
- reset();g_robot.chassis_interboard_control_active=true;g_robot.chassis.imu_ready=false;
- RobotChassisKinematics(&c);near(g_robot.chassis.actual_velocity.vx,0);
- // Paired startup origin only while disabled; a stationary gimbal and rotating base
- // must produce relative yaw opposite to chassis rotation.
- reset();g_robot.chassis.gimbal_imu_heading_valid=false;
- g_robot.chassis.yaw_angle=0.4f;imu_sample.yaw_delta_rad=0.2f;
- RobotChassisGimbalHeadingUpdate(true);assert(!g_robot.chassis.gimbal_imu_heading_valid);
- RobotChassisGimbalHeadingUpdate(false);assert(g_robot.chassis.gimbal_imu_heading_valid);
- near(g_robot.chassis.gimbal_imu_absolute_yaw,0);
- g_robot.chassis.yaw_angle=0.4f+(float)M_PI/2;
- RobotChassisGimbalHeadingUpdate(true);
- near(g_robot.chassis.gimbal_imu_absolute_yaw,0);
- near(g_robot.chassis.chassis_imu_absolute_yaw,(float)M_PI/2);
- // Both headings turn together: relative yaw returns to zero.
- imu_sample.yaw_delta_rad=0.2f+(float)M_PI/2;
- RobotChassisGimbalHeadingUpdate(true);near(g_robot.chassis.gimbal_imu_absolute_yaw,(float)M_PI/2);
- // Pairing survives wraparound without an extra revolution; source age is compensated.
- imu_sample.yaw_delta_rad=0.2f+(float)M_PI/2-2*(float)M_PI;
- RobotChassisGimbalHeadingUpdate(true);near(g_robot.chassis.gimbal_imu_absolute_yaw,(float)M_PI/2);
- imu_sample.yaw_rate_rad_s=1;imu_sample.source_age_ms=20;
- RobotChassisGimbalHeadingUpdate(true);near(g_robot.chassis.gimbal_imu_absolute_yaw,(float)M_PI/2+0.02f);
- // Cloud data dropouts never change the fixed frame, including recovery while disabled.
- // Set a different gimbal heading from chassis heading so re-zeroing both would fail.
- imu_sample.yaw_delta_rad=0.2f+(float)M_PI/6;
- imu_sample.yaw_rate_rad_s=0;imu_sample.source_age_ms=0;
- g_robot.chassis.yaw_angle=0.4f+(float)M_PI/2;
- RobotChassisGimbalHeadingUpdate(true);
- float original_gimbal_ref=g_robot.chassis.gimbal_imu_reference_delta;
- float original_body_ref=g_robot.chassis.gimbal_imu_chassis_reference_yaw;
- c=(HostVelocityCommand){.vx=0.2f,.wz=0.8f};
- g_robot.chassis_interboard_control_active=true;
- RobotChassisKinematics(&c);
- float before_x=g_robot.chassis.actual_velocity.vx,before_y=g_robot.chassis.actual_velocity.vy;
- for(int stopped=0;stopped<2;stopped++){
-  imu_valid=false;RobotChassisGimbalHeadingUpdate(!stopped);
-  assert(!g_robot.chassis.gimbal_imu_heading_valid);
-  assert(g_robot.chassis.gimbal_imu_origin_initialized);
-  imu_valid=true;RobotChassisGimbalHeadingUpdate(!stopped);
-  assert(g_robot.chassis.gimbal_imu_heading_valid);
-  near(g_robot.chassis.gimbal_imu_reference_delta,original_gimbal_ref);
-  near(g_robot.chassis.gimbal_imu_chassis_reference_yaw,original_body_ref);
-  near(g_robot.chassis.gimbal_imu_absolute_yaw,(float)M_PI/6);
-  near(g_robot.chassis.chassis_imu_absolute_yaw,(float)M_PI/2);
-  RobotChassisKinematics(&c);
-  near(g_robot.chassis.actual_velocity.vx,before_x);
-  near(g_robot.chassis.actual_velocity.vy,before_y);
- }
- // New real IMU headings received after the dropout still determine the current direction.
- imu_valid=false;RobotChassisGimbalHeadingUpdate(true);
- imu_valid=true;imu_sample.yaw_delta_rad=0.2f+(float)M_PI/3;
- RobotChassisGimbalHeadingUpdate(false);RobotChassisKinematics(&c);
- near(g_robot.chassis.gimbal_imu_absolute_yaw,(float)M_PI/3);
- near(g_robot.chassis.actual_velocity.vx,sinf((float)M_PI/3)*0.2f*kRobotChassisSpinForwardScale);
- near(g_robot.chassis.actual_velocity.vy,-cosf((float)M_PI/3)*0.2f*kRobotChassisSpinForwardScale);
- // Ordinary disable/re-enable must preserve the exact same world frame, too.
+ c.wz=0;RobotChassisKinematics(&c);assert(g_robot.chassis.steering_idle);
+ // No automatic zero capture at any initial angle, on disable, or on re-enable.
+ pose(0.7f,0);const float raw=g_robot.yaw_motor.state.angle;
  for(int i=0;i<100;i++)RobotChassisGimbalHeadingUpdate(false);
- near(g_robot.chassis.gimbal_imu_reference_delta,original_gimbal_ref);
- near(g_robot.chassis.gimbal_imu_chassis_reference_yaw,original_body_ref);
- // Sender reboot is a coordinate discontinuity; even DOWN must not silently assume alignment.
- imu_sample.sender_boot_id=43;
- RobotChassisGimbalHeadingUpdate(true);assert(!g_robot.chassis.gimbal_imu_heading_valid);
- RobotChassisGimbalHeadingUpdate(false);assert(!g_robot.chassis.gimbal_imu_heading_valid);
- near(g_robot.chassis.gimbal_imu_reference_delta,original_gimbal_ref);
- puts("PASS: fixed IMU origin across dropout/rearm, reboot invalidation, actual kinematics routing, full yaw sweep, swerve vectors, prediction, strafe, stop and feedback failures");
+ near(g_robot.chassis.big_yaw_relative_yaw_rad,0.7f);
+ memset(&g_robot.chassis,0,sizeof(g_robot.chassis));RobotChassisGimbalHeadingUpdate(true);
+ near(g_robot.chassis.big_yaw_relative_yaw_rad,0.7f);near(g_robot.chassis.big_yaw_encoder_angle_rad,raw);
+ // Stale/missing/faulted/non-finite encoder data blocks translation but preserves chassis spin request.
+ c=(HostVelocityCommand){.vx=0.2f,.wz=0.8f};
+ for(int failure=0;failure<5;failure++){
+  pose(0.4f,0);
+  if(failure==0)g_robot.yaw_feedback_valid=false;
+  if(failure==1)tick+=kRobotBigYawFeedbackTimeoutMs+1;
+  if(failure==2)g_robot.yaw_motor.state.angle=NAN;
+  if(failure==3)g_robot.yaw_motor.state.omega=INFINITY;
+  if(failure==4)g_robot.yaw_motor.state.error_code=8;
+  RobotChassisGimbalHeadingUpdate(true);assert(!g_robot.chassis.big_yaw_heading_valid);
+  RobotChassisKinematics(&c);
+  near(g_robot.chassis.actual_velocity.vx,0);near(g_robot.chassis.actual_velocity.vy,0);
+  near(g_robot.chassis.desired_velocity.omega_z,0.8f);
+ }
+ // Fresh feedback restores the current actual angle, without assuming alignment.
+ pose(-0.6f,0);RobotChassisKinematics(&c);
+ near(g_robot.chassis.actual_velocity.vy,sinf(-0.6f)*0.2f*kRobotChassisSpinForwardScale);
+ // UART7 body-frame input does not depend on yaw feedback or its position.
+ g_robot.chassis_interboard_control_active=false;g_robot.chassis.big_yaw_heading_valid=false;
+ RobotChassisKinematics(&c);
+ near(g_robot.chassis.actual_velocity.vx,0.2f*kRobotChassisSpinForwardScale);
+ near(g_robot.chassis.actual_velocity.vy,0);
+ puts("PASS: absolute encoder frame, fixed zero/sign, full rotations, IMU drift independence, rearm, feedback faults and actual swerve routing");
 }
 '''
-with tempfile.TemporaryDirectory(prefix='gimbal_translation_') as d:
-    p=Path(d);(p/'test.c').write_text(code)
-    subprocess.run(['gcc','-std=gnu11','-Wall','-Wextra','-Werror',*[f'-I{root}/Skywalker/{x}/Inc' for x in ('Algorithm','Device','Application')],str(p/'test.c'),str(root/'Skywalker/Algorithm/Src/alg_swerve.c'),'-lm','-o',str(p/'test')],check=True)
-    subprocess.run([str(p/'test')],check=True)
+with tempfile.TemporaryDirectory(prefix='encoder_translation_') as directory:
+    work=Path(directory)
+    for zero,sign in ((0.0,-1.0),(1.234,-1.0),(1.234,1.0)):
+        selected=re.sub(r'(kRobotBigYawForwardZeroRad = )[^;]+',rf'\g<1>{zero}f',code)
+        selected=re.sub(r'(kRobotBigYawGyroDirection = )[^;]+',rf'\g<1>{sign}f',selected)
+        (work/'test.c').write_text(selected)
+        subprocess.run(['gcc','-std=gnu11','-Wall','-Wextra','-Werror',
+                        *[f'-I{root}/Skywalker/{x}/Inc' for x in ('Algorithm','Device','Application')],
+                        str(work/'test.c'),str(root/'Skywalker/Algorithm/Src/alg_swerve.c'),
+                        '-lm','-o',str(work/'test')],check=True)
+        subprocess.run([str(work/'test')],check=True)

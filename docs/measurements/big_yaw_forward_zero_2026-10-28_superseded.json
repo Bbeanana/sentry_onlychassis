@@ -1,0 +1,54 @@
+{
+  "zero_rad": 5.472839,
+  "user_aligned_forward": true,
+  "read_method": "CMSIS-DAP live memory; flash matched current ELF; no halt/reset/write",
+  "startup": "Keep aligned and restart with new firmware; raw zero assumes initial wrap count 0",
+  "samples": [
+    {
+      "raw_rad": 5.47283935546875,
+      "continuous_rad": 55.47283935546875,
+      "wraps": 2,
+      "feedback_tick_ms": 485039,
+      "read_tick_ms": 485057,
+      "age_ms": 18,
+      "error_code": 0
+    },
+    {
+      "raw_rad": 5.47283935546875,
+      "continuous_rad": 55.47283935546875,
+      "wraps": 2,
+      "feedback_tick_ms": 485305,
+      "read_tick_ms": 485309,
+      "age_ms": 4,
+      "error_code": 0
+    },
+    {
+      "raw_rad": 5.47283935546875,
+      "continuous_rad": 55.47283935546875,
+      "wraps": 2,
+      "feedback_tick_ms": 485543,
+      "read_tick_ms": 485548,
+      "age_ms": 5,
+      "error_code": 0
+    },
+    {
+      "raw_rad": 5.47283935546875,
+      "continuous_rad": 55.47283935546875,
+      "wraps": 2,
+      "feedback_tick_ms": 485791,
+      "read_tick_ms": 485797,
+      "age_ms": 6,
+      "error_code": 0
+    },
+    {
+      "raw_rad": 5.47283935546875,
+      "continuous_rad": 55.47283935546875,
+      "wraps": 2,
+      "feedback_tick_ms": 486039,
+      "read_tick_ms": 486045,
+      "age_ms": 6,
+      "error_code": 0
+    }
+  ],
+  "superseded_reason": "User corrected physical forward alignment"
+}
