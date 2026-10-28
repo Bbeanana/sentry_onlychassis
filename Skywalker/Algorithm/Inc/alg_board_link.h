@@ -32,6 +32,7 @@ typedef enum {
   kBoardLinkOperatorControl = 0x0301,
   kBoardLinkBigYawRequest = 0x0402,
   kBoardLinkBigYawFeedback = 0x0403,
+  kBoardLinkGimbalImuYaw = 0x0404, // Local extension, 32-byte gimbal IMU snapshot.
 } BoardLinkMessageId;
 
 typedef enum {

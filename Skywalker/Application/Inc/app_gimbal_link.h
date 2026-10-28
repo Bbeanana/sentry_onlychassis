@@ -25,6 +25,20 @@ typedef struct {
   bool valid;
 } GimbalYawFeedback;
 
+// Local v4 0x0404: startup-relative gimbal IMU heading, SI units.
+typedef struct {
+  uint64_t sender_boot_id;
+  float yaw_delta_rad;
+  float yaw_rate_rad_s;
+  uint32_t source_age_ms;
+  uint32_t source_sequence;
+  uint32_t zero_generation;
+  uint64_t receiver_boot_id;
+  BoardLinkStamp stamp;
+  bool valid;
+} GimbalImuYaw;
+bool GimbalLinkGetImuYaw(GimbalImuYaw *yaw);
+
 void GimbalLinkInit(void);
 void GimbalLinkRxCallback(uint8_t *data, uint16_t length);
 

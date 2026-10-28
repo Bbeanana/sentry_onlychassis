@@ -26,7 +26,8 @@ base = base.replace(
     "  float chassis_steering_last_direction[4];\n"
     "  bool chassis_drive_steering_ready;\n"
     "  bool chassis_host_control_active;\n"
-    "  uint32_t chassis_imu_last_tick;",
+    "  uint32_t chassis_imu_last_tick;\n"
+    "  bool big_yaw_gyro_authorized;",
 )
 
 hal_stub = r"""
@@ -44,8 +45,10 @@ uint32_t test_tick, test_primask;
 enum { kRobotChassisEnabled = 1U, kRobotChassisHostControlEnabled = 1U,
        kRobotHostCommandTimeoutMs = 100U, kRobotDt7OfflineTimeoutMs = 100U,
        kRobotRemoteSwitchSafeModeEnabled = TEST_REMOTE_STOP,
-       kRobotCanDataLength = 8U, kRobotBigYawEnabled = 0U };
+       kRobotCanDataLength = 8U, kRobotBigYawEnabled = 0U,
+       kRobotBigYawGyroCompensationEnabled = 0U };
 static void RobotBigYawControl(void) {}
+static void RobotChassisImuUpdate(void) {}
 static uint32_t dt7_frames, dt7_tick;
 static uint32_t osKernelGetTickCount(void) { return test_tick; }
 static uint32_t Dt7FrameCount(void) { return dt7_frames; }

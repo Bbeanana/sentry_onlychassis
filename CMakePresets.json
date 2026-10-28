@@ -6,11 +6,7 @@
             "hidden": true,
             "generator": "Ninja",
             "binaryDir": "${sourceDir}/build/${presetName}",
-            "toolchainFile": "${sourceDir}/cmake/gcc-arm-none-eabi.cmake",
-            "cacheVariables": {
-                "CMAKE_C_COMPILER": "E:/all/DevEnv/GNU-tools-for-STM32/bin/arm-none-eabi-gcc.exe",
-                "CMAKE_CXX_COMPILER": "E:/all/DevEnv/GNU-tools-for-STM32/bin/arm-none-eabi-g++.exe"
-            }
+            "toolchainFile": "${sourceDir}/cmake/gcc-arm-none-eabi.cmake"
         },
         {
             "name": "Debug",

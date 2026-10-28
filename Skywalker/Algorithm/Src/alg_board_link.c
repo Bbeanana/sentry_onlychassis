@@ -80,6 +80,7 @@ static bool BoardLinkMessageIsKnown(uint16_t id) {
     case kBoardLinkOperatorControl:
     case kBoardLinkBigYawRequest:
     case kBoardLinkBigYawFeedback:
+    case kBoardLinkGimbalImuYaw:
       return true;
     default:
       return false;
@@ -91,7 +92,8 @@ static bool BoardLinkMessageRoleIsValid(uint16_t id, BoardLinkRole role) {
     return BoardLinkRoleIsValid(role);
   }
   if (id == kBoardLinkChassisControl || id == kBoardLinkChassisConstraint ||
-      id == kBoardLinkOperatorControl || id == kBoardLinkBigYawRequest) {
+      id == kBoardLinkOperatorControl || id == kBoardLinkBigYawRequest ||
+      id == kBoardLinkGimbalImuYaw) {
     return role == kBoardLinkRoleGimbalController;
   }
   if (id == kBoardLinkChassisFeedback || id == kBoardLinkBigYawFeedback) {

@@ -59,7 +59,7 @@ enum {
   // 0U: 遥控平移按大 Yaw/云台坐标执行，使用底盘本地大 Yaw 关节角。
   // 1U 仅用于不接云台板的单底盘调试，此时按车身坐标平移。
   kRobotChassisStandaloneMode = 0U,
-  // 非零旋转指令时启用 5ms 预测和小陀螺平移降速。
+  // 非零旋转指令时启用 7ms 预测和小陀螺平移降速。
   kRobotChassisSpinTranslationEnabled = 1U,
   // USART1（PA9 TX / PA10 RX）用于云台相对角/底盘状态通信。
   // 与 GM6020 FireWater 遥测和裁判串口互斥，下面已关闭遥测。
@@ -67,8 +67,10 @@ enum {
   // USART1 已被云台链路占用，GM6020 遥测关闭。
   kRobotGm6020TelemetryEnabled = 0U,
   kRobotGimbalEnabled = 0U,
-  // 大 Yaw 由底盘板执行：消费云台板 v4 BigYawRequest，J4310 MIT 力矩模式。
+  // 大 Yaw 由底盘板执行；陀螺仪补偿使用电机已配置的速度模式。
   kRobotBigYawEnabled = 1U,
+  // 1U: 外置云台 IMU 航向锁定 + 滚轮转向；0U: 原板间/右杆串级模式。
+  kRobotBigYawGyroCompensationEnabled = 1U,
   // 1U: 云台板离线时，右杆 ch0 直接控制大 Yaw（降级/手动模式）。
   kRobotBigYawRcFallback = 1U,
   kRobotShootEnabled = 0U,
@@ -98,6 +100,9 @@ _Static_assert(!(kRobotGimbalLinkEnabled && kRobotGm6020TelemetryEnabled),
                "USART1 cannot serve gimbal link and GM6020 telemetry simultaneously");
 _Static_assert(!(kRobotGimbalEnabled && kRobotBigYawEnabled),
                "yaw_motor cannot serve gimbal and big yaw simultaneously");
+_Static_assert(!kRobotBigYawGyroCompensationEnabled ||
+                   (kRobotBigYawEnabled && kRobotChassisEnabled),
+               "Gyro compensation requires chassis IMU and big yaw control");
 
 // 俯视底盘坐标：+X 向前，+Y 向左，正转角为逆时针。
 // 默认方形底盘，沿用原0.15m中心到轮距离；必须按实际轮距修改。
@@ -132,9 +137,19 @@ static const float kRobotMaxVyMps = 5.0f;
 static const float kRobotChassisMaxWheelSpeedMps = 5.0f;
 static const float kRobotSteeringCosineDeadbandRad = 0.05f;
 static const float kRobotMaxOmegaRadps = 10.0f;
-// 大 Yaw 只接受云台回中外环的速度请求，再做应用层限幅和方向适配。
+// 原板间/右杆模式的目标角速度限幅和方向适配。
 static const float kRobotBigYawMaxRateRadps = 1.0f;
 static const float kRobotBigYawDirection = 1.0f;
+// 电机正转与底盘正转物理方向相同时取 +1；反向安装取 -1。
+static const float kRobotBigYawGyroDirection = -1.0f;
+// 电机输出轴速度 / 大 Yaw 轴速度；直驱取 1，有外部减速需按实物配置。
+static const float kRobotBigYawGyroRatio = 1.0f;
+static const float kRobotBigYawGyroMaxRateRadps = 10.0f;
+// External gimbal IMU heading -> world-rate target -> measured world-rate PI.
+static const float kRobotBigYawHeadingKp = 2.0f;
+static const float kRobotBigYawHeadingCorrectionMaxRadps = 1.5f;
+static const float kRobotBigYawImuRateKp = 0.5f;
+static const float kRobotBigYawImuRateKi = 3.0f;
 // J4310 MIT 力矩模式：电机端 kp/kd=0，应用层完成位置/速度串级。
 static const float kRobotBigYawTorqueLimitNm = 3.0f;
 static const float kRobotBigYawPositionOutputMaxRadps = 2.0f;
@@ -143,18 +158,14 @@ static const float kRobotBigYawPositionOutputMaxRadps = 2.0f;
 static const float kRobotBigYawMaxPositionErrorRad = (float)M_PI / 2.0f;
 static const float kRobotBigYawCascadeFallbackDtS = 0.002f;
 static const float kRobotBigYawCascadeMaxDtS = 0.020f;
-/* Direction from the local big-Yaw encoder to the chassis translation frame.
- * Flip to -1 if moving the gimbal left makes the chassis translation rotate
- * the wrong way. */
-static const float kRobotBigYawAngleSign = 1.0f;
 // 右杆水平向右为正；沿用原云台 yaw 的方向约定。
 static const float kRobotBigYawRcSign = -1.0f;
 static const float kRobotChassisWheelMaxOmegaRadps = -14.0f;
 static const float kRobotNoRefereeCurrentScale = 0.5f;
 static const float kRobotChassisYawRateFeedbackKp = 0.5f;
 static const float kRobotChassisAutoSpinOmegaRadps = 4.0f;
-// 齐奇小陀螺：5 ms 航向前馈，横移/纵移分别保留 40%/30% 平移速度。
-static const float kRobotChassisSpinYawCompensationS = 0.005f;
+// 小陀螺：7 ms 航向预测，横移/纵移分别保留 40%/30% 平移速度。
+static const float kRobotChassisSpinYawCompensationS = 0.007f;
 static const float kRobotChassisSpinLateralScale = 0.4f;
 static const float kRobotChassisSpinForwardScale = 0.3f;
 static const float kRobotChassisSpinCommandEpsilon = 0.0001f;
@@ -229,6 +240,14 @@ typedef struct {
   float spin_translation_relative_yaw;
   bool big_yaw_angle_zero_valid;
   float big_yaw_angle_zero;
+  bool gimbal_imu_heading_valid;
+  bool gimbal_imu_origin_initialized;
+  uint32_t gimbal_imu_zero_generation;
+  uint64_t gimbal_imu_boot_id;
+  float gimbal_imu_reference_delta;
+  float gimbal_imu_chassis_reference_yaw;
+  float gimbal_imu_absolute_yaw;
+  float chassis_imu_absolute_yaw;
   uint32_t imu_sample_count;
   uint32_t imu_error_count;
 } RobotChassisState;
@@ -250,6 +269,7 @@ typedef struct {
   volatile bool chassis_6020_has_feedback[kRobotChassisMotorCount];
   bool chassis_drive_steering_ready;
   bool chassis_host_control_active;
+  bool chassis_interboard_control_active;
   bool chassis_steering_vector_active[kRobotChassisMotorCount];
   bool chassis_steering_target_initialized[kRobotChassisMotorCount];
   float chassis_steering_requested_angle[kRobotChassisMotorCount];
@@ -260,6 +280,14 @@ typedef struct {
   DmMotor yaw_motor;
   PidObject big_yaw_position_pid;
   PidObject big_yaw_velocity_pid;
+  bool big_yaw_heading_initialized;
+  uint64_t big_yaw_heading_boot_id;
+  uint32_t big_yaw_heading_zero_generation;
+  float big_yaw_heading_target_rad;
+  float big_yaw_heading_error_rad;
+  float big_yaw_world_rate_target_radps;
+  float big_yaw_imu_rate_integral;
+  float big_yaw_previous_operator_rate;
   bool big_yaw_target_initialized;
   float big_yaw_target_angle;
   float big_yaw_target_rate;
@@ -274,6 +302,8 @@ typedef struct {
   volatile bool yaw_feedback_valid;
   bool big_yaw_request_valid;
   bool big_yaw_manual_active;
+  bool big_yaw_gyro_authorized;
+  bool big_yaw_gyro_active;
   bool big_yaw_active;
   bool big_yaw_enabled;
   bool big_yaw_feedback_lost;
@@ -289,6 +319,8 @@ typedef struct {
 } RobotApp;
 
 static RobotApp g_robot;
+
+static void RobotBigYawControl(void);
 
 static float RobotClamp(float value, float min, float max) {
   if (value > max) {
@@ -705,8 +737,8 @@ static void RobotMotorInit(void) {
   DjiMotorInit(&g_robot.pitch_motor, kDjiMotorGm6020,
                kDjiMotorModePosition, &gimble_gm6020_speed_pid,&gimbie_gm6020_position_pid);
   DmMotorInit(&g_robot.yaw_motor, kDmMotorTypeJ4310,
-              kRobotGimbalEnabled != 0U ? kDmMotorModeVelocity
-                                        : kDmMotorModeMit,
+              (kRobotGimbalEnabled != 0U || kRobotBigYawGyroCompensationEnabled != 0U)
+                  ? kDmMotorModeVelocity : kDmMotorModeMit,
               0x06U, 0x11U);
   // MIT 帧只传递力矩，电机端不再叠加位置/速度增益。
   g_robot.yaw_motor.state.kp = 0.0f;
@@ -873,6 +905,39 @@ static void RobotChassisImuUpdate(void) {
   }
 }
 
+// Establish the shared frame once per chassis boot; availability never owns the origin.
+static void RobotChassisGimbalHeadingUpdate(bool motion_authorized) {
+  GimbalImuYaw sample;
+  if (!g_robot.chassis.imu_ready || !GimbalLinkGetImuYaw(&sample)) {
+    g_robot.chassis.gimbal_imu_heading_valid = false;
+    return;
+  }
+  bool same_origin = g_robot.chassis.gimbal_imu_origin_initialized &&
+      g_robot.chassis.gimbal_imu_boot_id == sample.sender_boot_id &&
+      g_robot.chassis.gimbal_imu_zero_generation == sample.zero_generation;
+  float gimbal_delta_now = RobotWrapPi(sample.yaw_delta_rad +
+      sample.yaw_rate_rad_s * (float)sample.source_age_ms * 0.001f);
+  if (!same_origin) {
+    g_robot.chassis.gimbal_imu_heading_valid = false;
+    // A restarted gimbal/sensor has a different zero. Do not pretend the current
+    // (possibly turned) gimbal and chassis are aligned; restart both boards aligned.
+    if (g_robot.chassis.gimbal_imu_origin_initialized || motion_authorized ||
+        fabsf(g_robot.chassis.yaw_rate) > 0.05f ||
+        fabsf(sample.yaw_rate_rad_s) > 0.05f) return;
+    g_robot.chassis.gimbal_imu_boot_id = sample.sender_boot_id;
+    g_robot.chassis.gimbal_imu_zero_generation = sample.zero_generation;
+    g_robot.chassis.gimbal_imu_reference_delta = gimbal_delta_now;
+    g_robot.chassis.gimbal_imu_chassis_reference_yaw = g_robot.chassis.yaw_angle;
+    g_robot.chassis.gimbal_imu_origin_initialized = true;
+  }
+  g_robot.chassis.gimbal_imu_heading_valid = true;
+  // Keep separate headings in the shared startup/world frame, never use the motor angle.
+  g_robot.chassis.gimbal_imu_absolute_yaw = RobotWrapPi(
+      gimbal_delta_now - g_robot.chassis.gimbal_imu_reference_delta);
+  g_robot.chassis.chassis_imu_absolute_yaw = RobotWrapPi(
+      g_robot.chassis.yaw_angle - g_robot.chassis.gimbal_imu_chassis_reference_yaw);
+}
+
 static bool RobotChassisRemoteVelocity(bool *spin_in_place) {
   float forward_stick = RobotRcNormalize(g_dt7_object.rocker.ch3);
   float left_stick = -RobotRcNormalize(g_dt7_object.rocker.ch2);
@@ -893,8 +958,9 @@ static bool RobotChassisRemoteVelocity(bool *spin_in_place) {
   float wheel_input = RobotApplyDeadband(
       RobotRcNormalize(g_dt7_object.rocker.wheel),
       kRobotChassisYawWheelDeadband);
-  bool wheel_spin_active = wheel_input != 0.0f;
-  float desired_yaw_rate = RobotChassisYawRateCommand(wheel_input);
+  (void)wheel_input; // wheel is consumed by big-Yaw control only
+  bool wheel_spin_active = false;
+  float desired_yaw_rate = RobotChassisYawRateCommand(0.0f);
   bool auto_spin_enabled = RobotAutoSpinIsEnabled();
   if (auto_spin_enabled) {
     if (g_robot.chassis.imu_ready) {
@@ -928,42 +994,33 @@ static void RobotChassisSpinTranslation(float *vx, float *vy,
   float reference_vx = *vx;
   float reference_vy = *vy;
   float gimbal_yaw = 0.0f;
+  float body_heading = 0.0f;
   if (!input_in_body_frame) {
-    // 底盘本地的大 Yaw 电机就是云台相对底盘的关节。上电手动摆正后，
-    // 第一条有效反馈角度作为零位；之后直接使用相对角，不做积分。
-    const bool feedback_fresh =
-        g_robot.yaw_feedback_valid &&
-        (uint32_t)(HAL_GetTick() - g_robot.yaw_feedback_tick) <=
-            kRobotBigYawFeedbackTimeoutMs;
-    if (!feedback_fresh || !isfinite(g_robot.yaw_motor.state.angle)) {
-      // 没有可信相对角时禁止遥控平移，旋转指令由独立 wz 保留。
-      *vx = 0.0f;
-      *vy = 0.0f;
+    // The gimbal board owns DM-IMU-L1 CAN3; use its transmitted IMU heading,
+    // paired with the chassis IMU. The big-Yaw motor encoder no longer sets this angle.
+    if (!g_robot.chassis.gimbal_imu_heading_valid) {
+      *vx = 0.0f; *vy = 0.0f;
       g_robot.chassis.spin_translation_active = false;
       g_robot.chassis.spin_drive_tracking = false;
       g_robot.chassis.spin_translation_relative_yaw = 0.0f;
       return;
     }
-    if (!g_robot.chassis.big_yaw_angle_zero_valid) {
-      g_robot.chassis.big_yaw_angle_zero =
-          g_robot.yaw_motor.state.angle;
-      g_robot.chassis.big_yaw_angle_zero_valid = true;
-    }
-    gimbal_yaw = RobotWrapPi(
-        kRobotBigYawAngleSign *
-        (g_robot.yaw_motor.state.angle -
-         g_robot.chassis.big_yaw_angle_zero));
+    gimbal_yaw = g_robot.chassis.gimbal_imu_absolute_yaw;
+    body_heading = g_robot.chassis.chassis_imu_absolute_yaw;
   }
   if (kRobotChassisSpinTranslationEnabled == 0U ||
       fabsf(desired_yaw_rate) <= kRobotChassisSpinCommandEpsilon) {
     g_robot.chassis.spin_translation_active = false;
     g_robot.chassis.spin_translation_relative_yaw = 0.0f;
-    // R(alpha): 云台前/左速度 -> 车身前/左速度，直行也需要转换。
-    *vx = cosf(gimbal_yaw) * reference_vx - sinf(gimbal_yaw) * reference_vy;
-    *vy = sinf(gimbal_yaw) * reference_vx + cosf(gimbal_yaw) * reference_vy;
+    // Step 1: gimbal IMU world heading defines where the joystick points.
+    float world_vx = cosf(gimbal_yaw) * reference_vx - sinf(gimbal_yaw) * reference_vy;
+    float world_vy = sinf(gimbal_yaw) * reference_vx + cosf(gimbal_yaw) * reference_vy;
+    // Step 2: express the world velocity at the chassis wheels, using chassis heading.
+    *vx = cosf(body_heading) * world_vx + sinf(body_heading) * world_vy;
+    *vy = -sinf(body_heading) * world_vx + cosf(body_heading) * world_vy;
     return;
   }
-  if (!g_robot.chassis.imu_ready) {
+  if (!input_in_body_frame && !g_robot.chassis.imu_ready) {
     // 没有有效航向时不静默退回随车头旋转的平移；保持已有旋转指令。
     g_robot.chassis.spin_translation_active = false;
     g_robot.chassis.spin_translation_relative_yaw = 0.0f;
@@ -976,32 +1033,35 @@ static void RobotChassisSpinTranslation(float *vx, float *vy,
     g_robot.chassis.spin_translation_active = true;
   }
 
-  // 积分航向仅保留作诊断，平移方向由实时云台相对角确定。
+  // 此处的旋转累计量仅作诊断；行进方向使用下方两个绝对航向。
   float body_yaw = RobotWrapPi(
       g_robot.chassis.yaw_angle - g_robot.chassis.spin_translation_reference_yaw);
   float relative_yaw = RobotWrapPi(
       body_yaw +
       g_robot.chassis.yaw_rate * kRobotChassisSpinYawCompensationS);
   g_robot.chassis.spin_translation_relative_yaw = relative_yaw;
-  // R(alpha - lead)，UART7 的 alpha=0；不再叠加累计航向转换。
-  float transform_yaw = g_robot.chassis.yaw_rate *
-                            kRobotChassisSpinYawCompensationS - gimbal_yaw;
-  float sin_yaw = sinf(transform_yaw);
-  float cos_yaw = cosf(transform_yaw);
+  // First use absolute gimbal IMU heading to get a world velocity.
+  float world_vx = cosf(gimbal_yaw) * reference_vx - sinf(gimbal_yaw) * reference_vy;
+  float world_vy = sinf(gimbal_yaw) * reference_vx + cosf(gimbal_yaw) * reference_vy;
+  // Chassis heading is only used for the final world -> wheel/body conversion.
+  float predicted_body = input_in_body_frame ? 0.0f : body_heading +
+      g_robot.chassis.yaw_rate * kRobotChassisSpinYawCompensationS;
+  float sin_yaw = sinf(predicted_body);
+  float cos_yaw = cosf(predicted_body);
   // 按原始输入选择降速比例，避免坐标转换后比例随航向跳变。
   float scale = fabsf(reference_vy) > kRobotChassisSpinCommandEpsilon
                     ? kRobotChassisSpinLateralScale
                     : (fabsf(reference_vx) > kRobotChassisSpinCommandEpsilon
                            ? kRobotChassisSpinForwardScale : 1.0f);
-  *vx = (cos_yaw * reference_vx + sin_yaw * reference_vy) * scale;
-  *vy = (-sin_yaw * reference_vx + cos_yaw * reference_vy) * scale;
+  *vx = (cos_yaw * world_vx + sin_yaw * world_vy) * scale;
+  *vy = (-sin_yaw * world_vx + cos_yaw * world_vy) * scale;
 }
 
 static void RobotChassisKinematics(const HostVelocityCommand *host_command) {
   bool steering_idle;
   bool wheel_spin_in_place;
   if (host_command != NULL) {
-    // UART7 始终为当前车身坐标：+vx 向车头，+vy 向车左，单位 m/s。
+    // 统一读取转发指令；下方按来源选择云台坐标或 UART7 车身坐标。
     g_robot.chassis.desired_velocity.vx =
         RobotClamp(host_command->vx, -kRobotMaxVxMps, kRobotMaxVxMps);
     g_robot.chassis.desired_velocity.vy =
@@ -1037,12 +1097,13 @@ static void RobotChassisKinematics(const HostVelocityCommand *host_command) {
     return;
   }
 
-  // 遥控默认使用实时云台坐标；UART7 保持当前车身坐标。
+  // 本地及云台板转发的遥控都使用实时云台坐标；UART7 保持当前车身坐标。
   // 不接云台板时没有相对角，单独底盘测试把 kRobotChassisStandaloneMode
   // 置 1，遥控平移直接按车身坐标执行，否则会被安全检查置零。
   // 接回云台板后改为 0，恢复云台坐标转换。
-  bool input_in_body_frame = host_command != NULL ||
-                             kRobotChassisStandaloneMode != 0U;
+  bool input_in_body_frame =
+      (host_command != NULL && !g_robot.chassis_interboard_control_active) ||
+      kRobotChassisStandaloneMode != 0U;
   float vx = g_robot.chassis.desired_velocity.vx;
   float vy = g_robot.chassis.desired_velocity.vy;
   float desired_yaw_rate = g_robot.chassis.desired_velocity.omega_z;
@@ -1093,6 +1154,12 @@ static void RobotChassisKinematics(const HostVelocityCommand *host_command) {
 
 static void RobotChassisControl(const HostVelocityCommand *host_command) {
   RobotChassisImuUpdate();
+  RobotChassisGimbalHeadingUpdate(true);
+  // 保留原有指令源选择；只有已通过底盘权限检查的控制分支进入这里。
+  if (kRobotBigYawGyroCompensationEnabled != 0U) {
+    g_robot.big_yaw_gyro_authorized = true;
+    RobotBigYawControl();
+  }
   RobotChassisKinematics(host_command);
 
   // 零速度时停止舵向角度控制并发送零电流；再次移动时从当前角度起步。
@@ -1316,8 +1383,10 @@ static void RobotBigYawSendCommand(DmMotorCommand command) {
 }
 
 static void RobotBigYawSendMitTorque(float torque_nm) {
-  float torque = RobotClamp(torque_nm, -kRobotBigYawTorqueLimitNm,
-                            kRobotBigYawTorqueLimitNm);
+  float torque = isfinite(torque_nm)
+                     ? RobotClamp(torque_nm, -kRobotBigYawTorqueLimitNm,
+                                  kRobotBigYawTorqueLimitNm)
+                     : 0.0f;
   // MIT 帧的 kp/kd 固定为 0：位置/速度闭环全部在应用层完成。
   g_robot.yaw_motor.state.given_angle = 0.0f;
   g_robot.yaw_motor.state.given_omega = 0.0f;
@@ -1331,20 +1400,98 @@ static void RobotBigYawSendMitTorque(float torque_nm) {
   g_robot.big_yaw_torque = torque;
 }
 
+static void RobotBigYawSendVelocity(float rate_rad_s) {
+  float rate = isfinite(rate_rad_s)
+                   ? RobotClamp(rate_rad_s, -kRobotBigYawGyroMaxRateRadps,
+                                kRobotBigYawGyroMaxRateRadps)
+                   : 0.0f;
+  g_robot.yaw_motor.state.given_omega = rate;
+  g_robot.yaw_motor.state.given_torque = 0.0f;
+  g_robot.big_yaw_torque = 0.0f;
+  uint8_t tx_data[kRobotCanDataLength] = {0};
+  DmMotorPackVelocity(&g_robot.yaw_motor, tx_data);
+  FdcanTransmit(&hfdcan3, tx_data, kRobotCanDataLength,
+                DmMotorTxId(&g_robot.yaw_motor));
+}
+
+static void RobotBigYawSendStop(void) {
+  if (g_robot.yaw_motor.mode == kDmMotorModeVelocity) {
+    RobotBigYawSendVelocity(0.0f);
+  } else {
+    RobotBigYawSendMitTorque(0.0f);
+  }
+}
+
 static void RobotBigYawResetCascade(void) {
   PidReset(&g_robot.big_yaw_position_pid);
   PidReset(&g_robot.big_yaw_velocity_pid);
+  g_robot.big_yaw_heading_initialized = false;
+  g_robot.big_yaw_heading_target_rad = 0.0f;
+  g_robot.big_yaw_heading_error_rad = 0.0f;
+  g_robot.big_yaw_world_rate_target_radps = 0.0f;
+  g_robot.big_yaw_imu_rate_integral = 0.0f;
+  g_robot.big_yaw_previous_operator_rate = 0.0f;
   g_robot.big_yaw_target_initialized = false;
   g_robot.big_yaw_target_angle = 0.0f;
   g_robot.big_yaw_target_rate = 0.0f;
   g_robot.big_yaw_torque = 0.0f;
 }
 
-/* 底盘板大 Yaw：消费云台板 v4 BigYawRequest，J4310 MIT 力矩模式。
- * 云台板请求优先；云台板离线时，右杆 ch0 可直接控制大 Yaw。
+// All angular feedback here is measured on the gimbal, in the IMU's world frame.
+// No chassis yaw command or reverse chassis angular-rate feedforward is used.
+static float RobotBigYawImuHeadingRate(const GimbalImuYaw *imu,
+                                       float operator_rate, float dt) {
+  float heading_now = RobotWrapPi(imu->yaw_delta_rad +
+      imu->yaw_rate_rad_s * (float)imu->source_age_ms * 0.001f);
+  if (!g_robot.big_yaw_heading_initialized ||
+      g_robot.big_yaw_heading_boot_id != imu->sender_boot_id ||
+      g_robot.big_yaw_heading_zero_generation != imu->zero_generation) {
+    g_robot.big_yaw_heading_initialized = true;
+    g_robot.big_yaw_heading_boot_id = imu->sender_boot_id;
+    g_robot.big_yaw_heading_zero_generation = imu->zero_generation;
+    g_robot.big_yaw_heading_target_rad = heading_now;
+    g_robot.big_yaw_imu_rate_integral = 0.0f;
+    g_robot.big_yaw_previous_operator_rate = 0.0f;
+  }
+  if (operator_rate == 0.0f && g_robot.big_yaw_previous_operator_rate != 0.0f) {
+    // Release the wheel: hold the current actual heading, not a lagging old target.
+    g_robot.big_yaw_heading_target_rad = heading_now;
+  } else {
+    g_robot.big_yaw_heading_target_rad = RobotWrapPi(
+        g_robot.big_yaw_heading_target_rad + operator_rate * dt);
+  }
+  g_robot.big_yaw_previous_operator_rate = operator_rate;
+  float error = RobotClamp(RobotWrapPi(g_robot.big_yaw_heading_target_rad - heading_now),
+      -kRobotBigYawMaxPositionErrorRad, kRobotBigYawMaxPositionErrorRad);
+  g_robot.big_yaw_heading_target_rad = RobotWrapPi(heading_now + error);
+  g_robot.big_yaw_heading_error_rad = error;
+  float world_rate_target = operator_rate + RobotClamp(kRobotBigYawHeadingKp * error,
+      -kRobotBigYawHeadingCorrectionMaxRadps, kRobotBigYawHeadingCorrectionMaxRadps);
+  g_robot.big_yaw_world_rate_target_radps = world_rate_target;
+  float rate_error = world_rate_target - imu->yaw_rate_rad_s;
+  float world_relative_limit = kRobotBigYawGyroMaxRateRadps / kRobotBigYawGyroRatio;
+  float proportional = kRobotBigYawImuRateKp * rate_error;
+  float integral = RobotClamp(g_robot.big_yaw_imu_rate_integral +
+      kRobotBigYawImuRateKi * rate_error * dt, -world_relative_limit, world_relative_limit);
+  float unclamped = proportional + integral;
+  // Do not integrate farther into speed saturation.
+  if ((unclamped <= world_relative_limit && unclamped >= -world_relative_limit) ||
+      (unclamped > world_relative_limit && rate_error < 0.0f) ||
+      (unclamped < -world_relative_limit && rate_error > 0.0f)) {
+    g_robot.big_yaw_imu_rate_integral = integral;
+  }
+  float relative_rate = RobotClamp(proportional + g_robot.big_yaw_imu_rate_integral,
+      -world_relative_limit, world_relative_limit);
+  return RobotClamp(kRobotBigYawGyroDirection * kRobotBigYawGyroRatio * relative_rate,
+      -kRobotBigYawGyroMaxRateRadps, kRobotBigYawGyroMaxRateRadps);
+}
+
+/* 底盘板大 Yaw：统一复用反馈/故障/使能管理。
+ * 航向锁定：外置云台 IMU 航向 P + 实测角速度 PI -> CAN3 0x206 速度帧。
+ * 关闭陀螺仪模式后，云台板请求优先，无有效请求时可由本地右杆接管。
  * 输入是目标角速度：应用层积分成连续目标角，再执行
  * “位置 PID -> 速度 PID -> MIT 力矩”，与云台 pitch 的执行器结构一致。
- * 请求超时、权限撤销、反馈丢失或故障时先发零力矩再失能，避免保留旧目标。 */
+ * 请求超时、权限撤销、反馈丢失或故障时先发零输出再失能，避免保留旧目标。 */
 static void RobotBigYawControl(void) {
   if (kRobotBigYawEnabled == 0U) {
     return;
@@ -1365,6 +1512,11 @@ static void RobotBigYawControl(void) {
   bool request_active = request_valid &&
                         request.mode == kBoardLinkBigYawFollowCenter &&
                         request.permission_valid && request.permission_enabled;
+  GimbalImuYaw gimbal_imu;
+  bool imu_available = GimbalLinkGetImuYaw(&gimbal_imu) &&
+      isfinite(gimbal_imu.yaw_delta_rad) && isfinite(gimbal_imu.yaw_rate_rad_s);
+  bool gyro_active = kRobotBigYawGyroCompensationEnabled != 0U &&
+                     g_robot.big_yaw_gyro_authorized && imu_available;
   /* Dt7LastUpdateTick() uses the RTOS tick, not HAL_GetTick(); mixing the
    * two time bases can make a live receiver look offline. */
   bool dt7_online = Dt7FrameCount() != 0U &&
@@ -1379,12 +1531,27 @@ static void RobotBigYawControl(void) {
   bool manual_active = kRobotBigYawRcFallback != 0U &&
                        kRobotGimbalEnabled == 0U && !request_valid &&
                        dt7_online;
+  float operator_yaw_rate = 0.0f;
+  if (request_active) {
+    operator_yaw_rate = RobotClamp(request.target_rate_rad_s,
+        -kRobotBigYawMaxRateRadps, kRobotBigYawMaxRateRadps);
+  } else if (!request_valid && !g_robot.chassis_interboard_control_active && dt7_online) {
+    operator_yaw_rate = RobotApplyDeadband(
+        RobotRcNormalize(g_dt7_object.rocker.wheel), kRobotChassisYawWheelDeadband) *
+        kRobotBigYawMaxRateRadps;
+  }
+  // 速度模式合成滚轮期望世界角速度与底盘自稳补偿；不叠加右杆位置环。
+  if (kRobotBigYawGyroCompensationEnabled != 0U) {
+    request_active = false;
+    manual_active = false;
+  }
   g_robot.big_yaw_request_valid = request_valid;
   g_robot.big_yaw_manual_active = manual_active;
+  g_robot.big_yaw_gyro_active = gyro_active;
 
-  if (!request_active && !manual_active) {
+  if (!request_active && !manual_active && !gyro_active) {
     if (g_robot.big_yaw_enabled) {
-      RobotBigYawSendMitTorque(0.0f);
+      RobotBigYawSendStop();
       RobotBigYawSendCommand(kDmMotorCommandDisable);
       g_robot.big_yaw_enabled = false;
     }
@@ -1408,7 +1575,7 @@ static void RobotBigYawControl(void) {
 
   if (error_code != 0U) {
     if (!g_robot.big_yaw_fault_latched) {
-      RobotBigYawSendMitTorque(0.0f);
+      RobotBigYawSendStop();
       RobotBigYawSendCommand(kDmMotorCommandDisable);
       RobotBigYawSendCommand(kDmMotorCommandClearError);
       g_robot.big_yaw_fault_latched = true;
@@ -1418,7 +1585,7 @@ static void RobotBigYawControl(void) {
     g_robot.big_yaw_active = false;
     RobotBigYawResetCascade();
     g_robot.big_yaw_last_command_sequence =
-        request_active ? request.source_sequence : 0U;
+        request_valid ? request.source_sequence : 0U;
     return;
   }
 
@@ -1440,7 +1607,7 @@ static void RobotBigYawControl(void) {
     /* A motor that was reporting feedback has gone silent.  Stop it once and
      * wait for feedback to return before attempting another enable cycle. */
     if (!g_robot.big_yaw_feedback_lost) {
-      RobotBigYawSendMitTorque(0.0f);
+      RobotBigYawSendStop();
       RobotBigYawSendCommand(kDmMotorCommandDisable);
       g_robot.big_yaw_feedback_lost = true;
     }
@@ -1469,8 +1636,8 @@ static void RobotBigYawControl(void) {
   if (g_robot.big_yaw_enable_repeat > 0U) {
     RobotBigYawSendCommand(kDmMotorCommandEnable);
     g_robot.big_yaw_enable_repeat--;
-    /* 使能窗口内保持零力矩，等反馈和控制状态稳定后再进入闭环。 */
-    RobotBigYawSendMitTorque(0.0f);
+    /* 使能窗口内发送当前模式的零输出，等待反馈和状态稳定。 */
+    RobotBigYawSendStop();
     g_robot.big_yaw_active = false;
     return;
   } else if (!g_robot.yaw_feedback_valid &&
@@ -1482,8 +1649,8 @@ static void RobotBigYawControl(void) {
   }
 
   if (!feedback_fresh) {
-    /* 尚未收到反馈时不输出力矩；保持使能并等待反馈或下一次 Enable 重试。 */
-    RobotBigYawSendMitTorque(0.0f);
+    /* 尚未收到反馈时保持零输出；保持使能并等待反馈或下一次 Enable 重试。 */
+    RobotBigYawSendStop();
     g_robot.big_yaw_active = false;
     RobotBigYawResetCascade();
     return;
@@ -1497,6 +1664,20 @@ static void RobotBigYawControl(void) {
     PidReset(&g_robot.big_yaw_velocity_pid);
   }
 
+  if (gyro_active) {
+    // Hold the external IMU heading with its actual rate feedback; no -chassis_rate term.
+    float target_rate = RobotBigYawImuHeadingRate(&gimbal_imu, operator_yaw_rate, dt);
+    g_robot.big_yaw_target_rate = target_rate;
+    g_robot.big_yaw_target_angle = feedback_angle;
+    g_robot.big_yaw_last_command_sequence = request_valid ? request.source_sequence : 0U;
+    PidReset(&g_robot.big_yaw_position_pid);
+    PidReset(&g_robot.big_yaw_velocity_pid);
+    RobotBigYawSendVelocity(target_rate);
+    g_robot.big_yaw_active = true;
+    g_robot.big_yaw_last_control_tick = now;
+    return;
+  }
+
   float target_rate;
   if (request_active) {
     target_rate = kRobotBigYawDirection * request.target_rate_rad_s;
@@ -1506,7 +1687,7 @@ static void RobotBigYawControl(void) {
         RobotRcNormalize(g_dt7_object.rocker.ch0),
         kRobotGimbalYawDeadband);
     target_rate = kRobotBigYawRcSign * rc * kRobotBigYawMaxRateRadps;
-    g_robot.big_yaw_last_command_sequence = 0U;
+    g_robot.big_yaw_last_command_sequence = request_valid ? request.source_sequence : 0U;
   }
   target_rate = RobotClamp(target_rate, -kRobotBigYawMaxRateRadps,
                            kRobotBigYawMaxRateRadps);
@@ -1554,7 +1735,8 @@ static void RobotSendBigYawFeedback(void) {
       .execution_state = g_robot.big_yaw_active
                              ? kBoardLinkExecutionRunning
                              : ((g_robot.big_yaw_request_valid ||
-                                 g_robot.big_yaw_manual_active)
+                                 g_robot.big_yaw_manual_active ||
+                                 g_robot.big_yaw_gyro_active)
                                     ? kBoardLinkExecutionWaiting
                                     : kBoardLinkExecutionDisabled),
       .ready = g_robot.big_yaw_active,
@@ -1641,6 +1823,12 @@ static void RobotEnterGimbalSafeMode(void) {
 }
 
 static void RobotEnterChassisSafeMode(void) {
+  RobotChassisImuUpdate();
+  RobotChassisGimbalHeadingUpdate(false);
+  if (kRobotBigYawGyroCompensationEnabled != 0U) {
+    g_robot.big_yaw_gyro_authorized = false;
+    RobotBigYawControl();
+  }
   RobotStopChassisMotors();
   RobotTransmitChassisStopCurrents();
 }
@@ -1794,7 +1982,8 @@ uint32_t ChassisTaskInit(void) {
 }
 
 void ChassisTaskLoop(void) {
-  if (kRobotBigYawEnabled != 0U) {
+  g_robot.chassis_interboard_control_active = false;
+  if (kRobotBigYawEnabled != 0U && kRobotBigYawGyroCompensationEnabled == 0U) {
     RobotBigYawControl();
   }
   if (kRobotChassisEnabled == 0U) {
@@ -1817,6 +2006,7 @@ void ChassisTaskLoop(void) {
         .wz = interboard_command.wz_rad_s,
     };
     RobotChassisSelectControlSource(true);
+    g_robot.chassis_interboard_control_active = true;
     RobotChassisControl(&command);
     return;
   }

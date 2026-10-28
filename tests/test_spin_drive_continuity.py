@@ -10,6 +10,7 @@ base = harness.split("static void test_vectors(void)")[0]
 base = base.replace(
     "bool chassis_steering_vector_active[4];",
     "bool chassis_steering_vector_active[4];\n"
+    "  bool big_yaw_gyro_authorized;\n"
     "  bool chassis_steering_target_initialized[4];\n"
     "  float chassis_steering_last_direction[4];\n"
     "  bool chassis_drive_steering_ready;\n"
@@ -27,13 +28,14 @@ constants = "\n".join(constant(name) for name in (
 stubs = r"""
 enum { kRobotChassisNoMotorTxTest = 0, kRobotChassisPeriodMs = 2,
        kRobotChassisFeedbackTimeoutMs = 50, kRobotRefereeEnabled = 0,
-       kRobotCanDataLength = 8 };
+       kRobotCanDataLength = 8, kRobotBigYawGyroCompensationEnabled = 0 };
 static const uint8_t kRobotChassisCanSlotWheelIndex[4] = {0U, 2U, 3U, 1U};
 static uint32_t tick = 100;
 static unsigned can_calls;
 static int hfdcan1, hfdcan3;
 static uint32_t osKernelGetTickCount(void) { return tick; }
 static void RobotChassisImuUpdate(void) { /* deterministic measured yaw below */ }
+static void RobotBigYawControl(void) {}
 static float RobotEstimateChassisPower(void) { return 0; }
 static float RobotChassisPowerLimit(void) { return 100; }
 static void RobotApplyChassisPowerLimit(float limit) { (void)limit; }

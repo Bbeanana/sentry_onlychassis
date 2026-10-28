@@ -1,6 +1,7 @@
 #include "app_gimbal_link.h"
 
 #include <stddef.h>
+#include <math.h>
 #include <string.h>
 
 #include "stm32h7xx_hal.h"
@@ -18,6 +19,10 @@ static BoardLinkParser g_parser;
 static volatile BoardLinkHeartbeat g_heartbeat;
 static volatile BoardLinkChassisControl g_chassis_control;
 static volatile BoardLinkBigYawRequest g_big_yaw_request;
+static volatile GimbalImuYaw g_imu_yaw;
+static volatile bool g_has_imu_yaw;
+static uint32_t g_last_imu_frame_sequence;
+static bool g_has_imu_sequence;
 static volatile bool g_has_heartbeat;
 static volatile bool g_has_chassis_control;
 static volatile bool g_has_big_yaw_request;
@@ -40,12 +45,24 @@ static uint64_t GimbalLinkMakeBootId(void) {
 }
 
 static void GimbalLinkResetPeerSnapshots(void) {
+  g_has_imu_yaw = false;
+  g_has_imu_sequence = false;
+  memset((void *)&g_imu_yaw, 0, sizeof(g_imu_yaw));
   g_has_chassis_control = false;
   g_has_control_sequence = false;
   g_has_big_yaw_request = false;
   g_has_big_yaw_sequence = false;
   memset((void *)&g_chassis_control, 0, sizeof(g_chassis_control));
   memset((void *)&g_big_yaw_request, 0, sizeof(g_big_yaw_request));
+}
+
+static uint32_t GimbalLinkLoad32(const uint8_t *p) {
+  return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
+         ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+static float GimbalLinkLoadFloat(const uint8_t *p) {
+  uint32_t raw = GimbalLinkLoad32(p); float value;
+  memcpy(&value, &raw, sizeof(value)); return value;
 }
 
 static void GimbalLinkAcceptFrame(const BoardLinkFrame *frame) {
@@ -81,6 +98,38 @@ static void GimbalLinkAcceptFrame(const BoardLinkFrame *frame) {
       g_has_control_sequence = true;
       g_chassis_control = control;
       g_has_chassis_control = true;
+      break;
+    }
+    case kBoardLinkGimbalImuYaw: {
+      const uint8_t *p = frame->payload;
+      if (frame->sender_role != kBoardLinkRoleGimbalController || frame->payload_length != 32U ||
+          p[0] > 1U || p[1] || p[2] || p[3]) return;
+      GimbalImuYaw sample = {
+          .yaw_delta_rad = GimbalLinkLoadFloat(p + 4),
+          .yaw_rate_rad_s = GimbalLinkLoadFloat(p + 8),
+          .source_age_ms = GimbalLinkLoad32(p + 12),
+          .source_sequence = GimbalLinkLoad32(p + 16),
+          .zero_generation = GimbalLinkLoad32(p + 20),
+          .receiver_boot_id = (uint64_t)GimbalLinkLoad32(p + 24) |
+                              ((uint64_t)GimbalLinkLoad32(p + 28) << 32),
+          .stamp = {.timestamp_ms = frame->received_ms, .sequence = frame->frame_sequence, .valid = true},
+          .valid = p[0] != 0,
+      };
+      if (sample.receiver_boot_id != g_local_boot_id || sample.zero_generation == 0 ||
+          !isfinite(sample.yaw_delta_rad) || !isfinite(sample.yaw_rate_rad_s) ||
+          fabsf(sample.yaw_delta_rad) > 3.142f || fabsf(sample.yaw_rate_rad_s) > 35.0f ||
+          (g_has_imu_sequence && !BoardLinkSequenceIsNewer(frame->frame_sequence, g_last_imu_frame_sequence))) return;
+      // Repeated sensor samples must not refresh their physical freshness.
+      if (sample.valid && g_has_imu_yaw && g_imu_yaw.valid &&
+          sample.zero_generation == g_imu_yaw.zero_generation &&
+          sample.source_sequence == g_imu_yaw.source_sequence) {
+        uint32_t elapsed = (uint32_t)(HAL_GetTick() - g_imu_yaw.stamp.timestamp_ms);
+        uint32_t prior_age = g_imu_yaw.source_age_ms;
+        uint32_t age = prior_age > 50U || elapsed > 50U ? 51U : prior_age + elapsed;
+        if (sample.source_age_ms < age) sample.source_age_ms = age;
+      }
+      g_last_imu_frame_sequence = frame->frame_sequence; g_has_imu_sequence = true;
+      g_imu_yaw = sample; g_has_imu_yaw = true;
       break;
     }
     case kBoardLinkBigYawRequest: {
@@ -164,6 +213,7 @@ void GimbalLinkInit(void) {
   memset((void *)&g_chassis_control, 0, sizeof(g_chassis_control));
   memset((void *)&g_big_yaw_request, 0, sizeof(g_big_yaw_request));
   memset((void *)&g_legacy_feedback, 0, sizeof(g_legacy_feedback));
+  GimbalLinkResetPeerSnapshots();
   g_has_heartbeat = false;
   g_has_chassis_control = false;
   g_has_big_yaw_request = false;
@@ -203,6 +253,25 @@ bool GimbalLinkGetChassisControl(BoardLinkChassisControl *control) {
   }
   *control = sample;
   return true;
+}
+
+bool GimbalLinkGetImuYaw(GimbalImuYaw *yaw) {
+  if (yaw == NULL) return false;
+  uint32_t mask = __get_PRIMASK(); __disable_irq();
+  GimbalImuYaw sample = g_imu_yaw; bool available = g_has_imu_yaw;
+  BoardLinkHeartbeat peer = g_heartbeat;
+  bool peer_available = g_has_heartbeat;
+  sample.sender_boot_id = peer_available ? peer.sender_boot_id : 0U;
+  __set_PRIMASK(mask);
+  uint32_t age = (uint32_t)(HAL_GetTick() - sample.stamp.timestamp_ms);
+  if (!available || !sample.valid || !peer_available || !peer.stamp.valid ||
+      (uint32_t)(HAL_GetTick() - peer.stamp.timestamp_ms) > kGimbalLinkHeartbeatTimeoutMs ||
+      sample.receiver_boot_id != g_local_boot_id || sample.source_age_ms > 50U ||
+      age > 50U - sample.source_age_ms) {
+    *yaw = (GimbalImuYaw){0}; return false;
+  }
+  sample.source_age_ms += age;
+  *yaw = sample; return true;
 }
 
 bool GimbalLinkGetBigYawRequest(BoardLinkBigYawRequest *request) {
